@@ -1,17 +1,12 @@
 /**
  * docx-engine.js -- Engine pembuat file .docx langsung di browser dari template
  * ber-tag Jinja/docxtpl ({{ var }}, {% for %}, {% if %}, {% tr for %}).
- *
- * Menggunakan:
- *   - JSZip    (membaca/menulis paket ZIP .docx)
- *   - Nunjucks (mengevaluasi tag Jinja2 pada XML Word)
- *   - Canvas   (mengonversi gambar WebP/lainnya ke PNG & membaca ukuran piksel)
  */
 (function (global) {
   "use strict";
 
   const EMU_PER_MM = 36000;
-  const EMU_PER_PX_96DPI = 9525; // 1 px @ 96 DPI = 9525 EMU
+  const EMU_PER_PX_96DPI = 9525;
 
   // =========================================================================
   // 1. UTILITAS GAMBAR & XML
@@ -25,10 +20,6 @@
       .replace(/'/g, "&apos;");
   }
 
-  /**
-   * Pastikan gambar berformat PNG atau JPEG (Word tidak mendukung WebP)
-   * dan kembalikan { buffer, ext, mime }.
-   */
   async function normalizeImageForWord(blob) {
     const type = (blob && blob.type) || "";
     if (type === "image/png") {
@@ -108,11 +99,6 @@
     );
   }
 
-  /**
-   * Membangun XML tabel Word untuk lampiran Rekapitulasi Bahan Baku.
-   * Menggunakan <w:tblHeader/> pada baris judul dan <w:cantSplit/> pada tiap baris
-   * agar tabel rapi jika melintasi batas halaman cetak.
-   */
   function buildBahanBakuTableXml(rows) {
     const border = `<w:tcBorders>` +
       `<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
@@ -147,7 +133,7 @@
   }
 
   // =========================================================================
-  // 2. PRE-PROCESSING XML WORD (GABUNG RUN TERPECAH + NORMALISASI TAG JINJA)
+  // 2. PRE-PROCESSING XML WORD
   // =========================================================================
   function decodeEntities(s) {
     return s
@@ -214,21 +200,18 @@
       return `${prefix}${currentTr}${suffix}`;
     });
 
-    // 2. Proses setiap paragraf <w:p> secara terisolasi (tidak pernah lintas paragraf)
+    // 2. Proses setiap paragraf <w:p> secara terisolasi
     out = out.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (pXml) => {
       const plain = stripInlineXml(pXml).trim();
 
-      // Jika seluruh paragraf hanya berisi satu atau lebih tag kontrol {% ... %}
       if (/^(?:\{%-?[\s\S]*?-?%\}\s*)+$/.test(plain)) {
         return plain.replace(/\{%[\s\S]*?%\}/g, (t) => normalizeJinjaTag(t));
       }
 
-      // Placeholder khusus tabel Rekapitulasi Bahan Baku ({{ tabel_rekap }})
       if (/\{\{\s*tabel_rekap\s*\}\}/.test(plain)) {
         return "{{ tabel_rekap | safe }}";
       }
 
-      // Bersihkan tag Jinja di dalam teks paragraf ini saja
       return pXml.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) => normalizeJinjaTag(tag));
     });
 
@@ -236,7 +219,7 @@
   }
 
   // =========================================================================
-  // 3. ESCAPE DATA KONTEKS, SANITASI OPENXML & PENGUNCIAN TATA LETAK CETAK
+  // 3. ESCAPE KONTEKS, INJEKSI GAMBAR AMAN & SANITASI OPENXML
   // =========================================================================
   function escapeContext(val) {
     if (val === null || val === undefined) return "";
@@ -272,10 +255,6 @@
     }
   }
 
-  /**
-   * Pastikan setiap baris tabel (<w:tr>) yang berisi gambar memiliki properti
-   * <w:cantSplit/> agar gambar dan keterangannya tidak terbelah di antara dua halaman.
-   */
   function enforceTableCantSplit(xmlString) {
     return xmlString.replace(/<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/g, (match, inner) => {
       if (!inner.includes("§§IMG:")) return match;
@@ -287,34 +266,56 @@
   }
 
   /**
-   * Pastikan struktur XML valid menurut spesifikasi OpenXML Word:
-   * - Setiap sel tabel <w:tc> wajib memiliki minimal 1 <w:p> di dalamnya.
-   * - Setiap baris tabel <w:tr> wajib memiliki minimal 1 <w:tc> (jika kosong akibat loop, hapus baris).
-   * - Hapus run teks kosong <w:t xml:space="preserve"></w:t> sisa pemecahan gambar.
+   * Sisipkan <w:drawing> menggantikan token di level <w:r> secara bersih
+   * sehingga tidak pernah membuat <w:r> bersarang di dalam <w:r>.
    */
+  function replaceImageTokenInRuns(xmlString, token, drawingXml) {
+    return xmlString.replace(/<w:r\b[^>]*>[\s\S]*?<\/w:r>/g, (runXml) => {
+      if (!runXml.includes(token)) return runXml;
+
+      const rPrMatch = runXml.match(/<w:rPr>[\s\S]*?<\/w:rPr>/);
+      const rPr = rPrMatch ? rPrMatch[0] : "";
+
+      const textMatches = [...runXml.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g)];
+      const fullText = textMatches.map((m) => m[1]).join("");
+      const parts = fullText.split(token);
+
+      let outRuns = "";
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i]) {
+          outRuns += `<w:r>${rPr}<w:t xml:space="preserve">${parts[i]}</w:t></w:r>`;
+        }
+        if (i < parts.length - 1) {
+          outRuns += `<w:r>${drawingXml}</w:r>`;
+        }
+      }
+      return outRuns;
+    });
+  }
+
   function sanitizeWordXml(xmlString) {
     let out = xmlString;
 
-    // 1. Hapus <w:tr> yang tidak memiliki satu pun <w:tc>
+    // 1. Hapus <w:tr> tanpa <w:tc>
     out = out.replace(/<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/g, (match, inner) => {
       return /<w:tc\b/.test(inner) ? match : "";
     });
 
-    // 2. Pastikan setiap <w:tc> memiliki minimal satu <w:p> (syarat wajib skema Word)
+    // 2. Pastikan setiap <w:tc> memiliki minimal satu <w:p> (aturan wajib OpenXML)
     out = out.replace(/<w:tc\b[^>]*>([\s\S]*?)<\/w:tc>/g, (match, inner) => {
       if (/<w:p\b/.test(inner)) return match;
       return match.replace("</w:tc>", "<w:p/></w:tc>");
     });
 
-    // 3. Bersihkan <w:r> kosong yang hanya berisi <w:t></w:t> tanpa teks
-    out = out.replace(/<w:r>\s*<w:t(?:\s+xml:space="preserve")?><\/w:t>\s*<\/w:r>/g, "");
+    // 3. Pastikan <w:tbl> di dalam <w:tc> diikuti <w:p/> (aturan wajib OpenXML jika tabel terakhir di sel)
+    out = out.replace(/<\/w:tbl>\s*<\/w:tc>/g, "</w:tbl><w:p/></w:tc>");
+
+    // 4. Hapus <w:r> kosong
+    out = out.replace(/<w:r(?:\s[^>]*)?>\s*(?:<w:rPr>[\s\S]*?<\/w:rPr>)?\s*<w:t(?:\s+xml:space="preserve")?><\/w:t>\s*<\/w:r>/g, "");
 
     return out;
   }
 
-  /**
-   * Validasi XML menggunakan DOMParser browser sebelum file .docx diunduh.
-   */
   function validateXmlStructure(xmlString, xmlPath) {
     if (typeof DOMParser === "undefined") return;
     const parser = new DOMParser();
@@ -352,9 +353,15 @@
     let relsXml = await zip.file(relsPath).async("string");
     let contentTypesXml = await zip.file("[Content_Types].xml").async("string");
 
-    const idNums = [...relsXml.matchAll(/Id="rId(\d+)"/g)].map((m) => parseInt(m[1], 10));
-    let nextRelNum = (idNums.length ? Math.max(...idNums) : 10) + 1;
-    let docPrCounter = 100;
+    const usedRelIds = new Set([...relsXml.matchAll(/Id="([^"]+)"/g)].map((m) => m[1]));
+    let nextRelNum = 100;
+    const allocRelId = () => {
+      while (usedRelIds.has(`rId${nextRelNum}`)) nextRelNum++;
+      const id = `rId${nextRelNum++}`;
+      usedRelIds.add(id);
+      return id;
+    };
+
     const addedExts = new Set();
 
     const xmlTargets = Object.keys(zip.files).filter(
@@ -363,8 +370,12 @@
 
     for (const xmlPath of xmlTargets) {
       const rawXml = await zip.file(xmlPath).async("string");
-      const prepared = preprocessDocxXml(rawXml);
 
+      // Ambil ID docPr tertinggi agar tidak bentrok dengan gambar bawaan template
+      const existingDocPrIds = [...rawXml.matchAll(/<wp:docPr\b[^>]*\bid="(\d+)"/g)].map((m) => parseInt(m[1], 10));
+      let docPrCounter = (existingDocPrIds.length ? Math.max(...existingDocPrIds) : 100) + 10;
+
+      const prepared = preprocessDocxXml(rawXml);
       const renderCtx = Object.assign({}, safeCtx);
       ensureAllTemplateVarsDefined(prepared, renderCtx);
 
@@ -375,7 +386,6 @@
         throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
       }
 
-      // Kunci baris tabel yang berisi gambar agar tidak terpotong antar halaman
       if (xmlPath === "word/document.xml") {
         rendered = enforceTableCantSplit(rendered);
       }
@@ -387,7 +397,6 @@
           const natural = await getImageNaturalSize(job.blob).catch(() => ({ width: 400, height: 300 }));
 
           let cx, cy;
-          // Batas tinggi aman per sel/halaman A4 (105 mm untuk grid 2 kolom, 210 mm untuk 1 kolom penuh)
           const maxHeightMm = job.widthMm && job.widthMm <= 80 ? 105 : 210;
           const maxCy = Math.round(maxHeightMm * EMU_PER_MM);
 
@@ -415,7 +424,7 @@
             }
           }
 
-          const rId = `rId${nextRelNum++}`;
+          const rId = allocRelId();
           const docPrId = docPrCounter++;
           const mediaFile = `media/img_${docPrId}.${norm.ext}`;
           zip.file(`word/${mediaFile}`, norm.buffer);
@@ -427,14 +436,7 @@
           addedExts.add(norm.ext);
 
           const drawingXml = buildDrawingXml(rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
-          // Sisipkan gambar di dalam <w:r> secara aman baik berada di dalam <w:t> maupun langsung di <w:p>
-          rendered = rendered.replace(new RegExp(`(<w:t\\b[^>]*>)([^<]*)${token}([^<]*)(</w:t>)`, "g"), (m, tOpen, before, after, tClose) => {
-            const partBefore = before ? `${tOpen}${before}${tClose}` : "";
-            const partAfter = after ? `${tOpen}${after}${tClose}` : "";
-            return `${partBefore}</w:r><w:r>${drawingXml}</w:r><w:r>${partAfter}`;
-          });
-          // Fallback jika token berada di luar <w:t>
-          rendered = rendered.split(token).join(`<w:r>${drawingXml}</w:r>`);
+          rendered = replaceImageTokenInRuns(rendered, token, drawingXml);
         }
       }
 

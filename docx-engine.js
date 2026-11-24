@@ -1,6 +1,6 @@
 /**
  * docx-engine.js -- Engine pembuat file .docx langsung di browser dari template
- * ber-tag Jinja/docxtpl ({{ var }}, {% for %}, {% if %}, {% tr for %}).
+ * ber-tag Jinja/docxtpl ({{ var }}, {% for %}, {% if %}, {% tr for %}, {% tc for %}, {% p if %}).
  */
 (function (global) {
   "use strict";
@@ -8,6 +8,10 @@
   const EMU_PER_MM = 36000;
   const EMU_PER_PX_96DPI = 9525;
   const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+  const A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main";
+  const PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+  const R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
   // =========================================================================
   // 1. UTILITAS GAMBAR & XML
@@ -66,26 +70,25 @@
     }
   }
 
-  function buildDrawingXml(rId, docPrId, name, cx, cy) {
-    return (
+  function createDrawingElement(doc, rId, docPrId, name, cx, cy) {
+    const drawingXml =
       `<w:drawing xmlns:w="${W_NS}">` +
-      `<wp:inline distT="0" distB="0" distL="0" distR="0"` +
-      ` xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">` +
+      `<wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="${WP_NS}">` +
       `<wp:extent cx="${cx}" cy="${cy}"/>` +
       `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
       `<wp:docPr id="${docPrId}" name="${escapeXml(name)}"/>` +
       `<wp:cNvGraphicFramePr>` +
-      `<a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>` +
+      `<a:graphicFrameLocks xmlns:a="${A_NS}" noChangeAspect="1"/>` +
       `</wp:cNvGraphicFramePr>` +
-      `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+      `<a:graphic xmlns:a="${A_NS}">` +
       `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
-      `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:pic xmlns:pic="${PIC_NS}">` +
       `<pic:nvPicPr>` +
       `<pic:cNvPr id="${docPrId}" name="${escapeXml(name)}"/>` +
       `<pic:cNvPicPr/>` +
       `</pic:nvPicPr>` +
       `<pic:blipFill>` +
-      `<a:blip r:embed="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>` +
+      `<a:blip r:embed="${rId}" xmlns:r="${R_NS}"/>` +
       `<a:stretch><a:fillRect/></a:stretch>` +
       `</pic:blipFill>` +
       `<pic:spPr>` +
@@ -96,8 +99,9 @@
       `</a:graphicData>` +
       `</a:graphic>` +
       `</wp:inline>` +
-      `</w:drawing>`
-    );
+      `</w:drawing>`;
+    const parsed = new DOMParser().parseFromString(drawingXml, "application/xml");
+    return doc.importNode(parsed.documentElement, true);
   }
 
   function buildBahanBakuTableXml(rows) {
@@ -116,7 +120,7 @@
     };
 
     let xml =
-      `<w:tbl><w:tblPr><w:tblW w:w="8500" w:type="dxa"/>` +
+      `<w:tbl xmlns:w="${W_NS}"><w:tblPr><w:tblW w:w="8500" w:type="dxa"/>` +
       `<w:tblBorders>` +
       `<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
       `<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
@@ -129,12 +133,12 @@
     rows.forEach((r) => {
       xml += row([String(r.no), r.nama_bahan, r.produsen, r.asal], false, false);
     });
-    xml += `</w:tbl><w:p/>`;
+    xml += `</w:tbl>`;
     return xml;
   }
 
   // =========================================================================
-  // 2. PRE-PROCESSING XML WORD BERBASIS DOM
+  // 2. PRE-PROCESSING XML WORD BERBASIS DOM (SEMUA SINTAKS DOCXTPL)
   // =========================================================================
   function cleanText(s) {
     return String(s || "")
@@ -164,6 +168,23 @@
     }
   }
 
+  function findAncestor(node, localName) {
+    let cur = node && node.parentNode;
+    while (cur) {
+      if (cur.localName === localName && cur.namespaceURI === W_NS) return cur;
+      cur = cur.parentNode;
+    }
+    return null;
+  }
+
+  /**
+   * Memproses XML Word menggunakan DOMParser sehingga:
+   * 1. Semua tag terpecah lintas <w:r>/<w:t> di satu paragraf digabung utuh.
+   * 2. Tag khusus docxtpl ({% tr ... %}, {% tc ... %}, {% p ... %}, {% r ... %})
+   *    dan tag kontrol paragraf tunggal ({% if/for/elif/else/endif/endfor %})
+   *    ditempatkan tepat di luar elemen XML pembungkusnya sehingga tidak pernah
+   *    memotong <w:t>, <w:r>, <w:p>, <w:tc>, atau <w:tr>.
+   */
   function preprocessDocxDom(rawXml) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(rawXml, "application/xml");
@@ -174,6 +195,7 @@
 
     unwrapContentControls(doc);
 
+    // Tahap 1: Gabungkan seluruh run <w:t> di setiap paragraf <w:p> yang mengandung {{ atau {%
     const paragraphs = Array.from(doc.getElementsByTagNameNS(W_NS, "p"));
     for (const p of paragraphs) {
       const tNodes = Array.from(p.getElementsByTagNameNS(W_NS, "t"));
@@ -182,74 +204,135 @@
       const fullText = cleanText(tNodes.map((t) => t.textContent || "").join(""));
       if (!/\{\{|\{%|\{#/.test(fullText)) continue;
 
+      // Placeholder tabel rekapitulasi bahan baku
       if (/^\{\{\s*tabel_rekap\s*\}\}$/.test(fullText.trim())) {
-        const placeholderNode = doc.createTextNode("{{ tabel_rekap | safe }}");
-        p.parentNode.replaceChild(placeholderNode, p);
+        p.parentNode.replaceChild(doc.createTextNode("§§TABEL_REKAP§§"), p);
         continue;
       }
 
-      const trimmed = fullText.trim();
-      if (
-        /^(?:\{%-?[\s\S]*?-?%\}\s*)+$/.test(trimmed) &&
-        !/\{%-?\s*tr\b/.test(trimmed)
-      ) {
-        const normalizedCtrl = trimmed.replace(/\{%[\s\S]*?%\}/g, (t) => normalizeJinjaExpression(t));
-        const ctrlNode = doc.createTextNode(normalizedCtrl);
-        p.parentNode.replaceChild(ctrlNode, p);
-        continue;
-      }
-
-      const normalizedParaText = fullText.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) =>
+      // Normalisasi ekspresi Jinja di dalam paragraf
+      const normalized = fullText.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) =>
         normalizeJinjaExpression(tag)
       );
 
-      tNodes[0].textContent = normalizedParaText;
+      tNodes[0].textContent = normalized;
       tNodes[0].setAttribute("xml:space", "preserve");
       for (let i = 1; i < tNodes.length; i++) {
         tNodes[i].textContent = "";
       }
     }
 
-    const rows = Array.from(doc.getElementsByTagNameNS(W_NS, "tr"));
-    for (const tr of rows) {
-      const tNodes = Array.from(tr.getElementsByTagNameNS(W_NS, "t"));
-      let prefix = "";
-      let suffix = "";
+    // Tahap 2: Ekstrak tag kontrol docxtpl ke level elemen struktural yang tepat
+    const allT = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
+    for (const t of allT) {
+      let txt = t.textContent || "";
+      if (!txt.includes("{%")) continue;
 
-      for (const t of tNodes) {
-        let txt = t.textContent || "";
-        const mStart = txt.match(/\{%-?\s*tr\s+(for\b[\s\S]*?)-?%\}/);
-        if (mStart) {
-          prefix += `{% ${normalizeJinjaExpression(mStart[1])} %}`;
-          txt = txt.replace(mStart[0], "");
-        }
-        const mEnd = txt.match(/\{%-?\s*tr\s+endfor\s*-?%\}/);
-        if (mEnd) {
-          suffix += `{% endfor %}`;
-          txt = txt.replace(mEnd[0], "");
-        }
-        t.textContent = txt;
+      // 2a. {% tr ... %} -> bungkus <w:tr>
+      const trEl = findAncestor(t, "tr");
+      if (trEl) {
+        txt = txt.replace(/\{%-?\s*tr\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          trEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), trEl);
+          return "";
+        });
+        txt = txt.replace(/\{%-?\s*tr\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          trEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), trEl.nextSibling);
+          return "";
+        });
       }
 
-      if (prefix) {
-        tr.parentNode.insertBefore(doc.createTextNode(prefix), tr);
+      // 2b. {% tc ... %} -> bungkus <w:tc>
+      const tcEl = findAncestor(t, "tc");
+      if (tcEl) {
+        txt = txt.replace(/\{%-?\s*tc\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          tcEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), tcEl);
+          return "";
+        });
+        txt = txt.replace(/\{%-?\s*tc\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          tcEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), tcEl.nextSibling);
+          return "";
+        });
       }
-      if (suffix) {
-        tr.parentNode.insertBefore(doc.createTextNode(suffix), tr.nextSibling);
+
+      // 2c. {% p ... %} -> bungkus <w:p>
+      const pEl = findAncestor(t, "p");
+      if (pEl) {
+        txt = txt.replace(/\{%-?\s*p\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          pEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), pEl);
+          return "";
+        });
+        txt = txt.replace(/\{%-?\s*p\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          pEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), pEl.nextSibling);
+          return "";
+        });
       }
+
+      // 2d. {% r ... %} -> bungkus <w:r>
+      const rEl = findAncestor(t, "r");
+      if (rEl) {
+        txt = txt.replace(/\{%-?\s*r\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          rEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), rEl);
+          return "";
+        });
+        txt = txt.replace(/\{%-?\s*r\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+          rEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), rEl.nextSibling);
+          return "";
+        });
+      }
+
+      t.textContent = txt;
+    }
+
+    // Tahap 3: Paragraf yang isinya murni tag kontrol ({% if/for/else/elif/endif/endfor %})
+    // dipindahkan keluar dari <w:p> agar tidak menyisakan baris kosong dan tidak memotong <w:t>
+    const paragraphsAfter = Array.from(doc.getElementsByTagNameNS(W_NS, "p"));
+    for (const p of paragraphsAfter) {
+      const tNodes = Array.from(p.getElementsByTagNameNS(W_NS, "t"));
+      const fullText = cleanText(tNodes.map((t) => t.textContent || "").join("")).trim();
+      if (fullText && /^(?:\{%-?[\s\S]*?-?%\}\s*)+$/.test(fullText)) {
+        p.parentNode.replaceChild(doc.createTextNode(fullText), p);
+      }
+    }
+
+    // Tahap 4: Jika di dalam satu paragraf terdapat tag kontrol {% ... %} bercampur teks biasa,
+    // pecah menjadi <w:r> terpisah sehingga blok {% if %} tidak pernah menelan </w:t> milik teks lain
+    const runsWithCtrl = Array.from(doc.getElementsByTagNameNS(W_NS, "r"));
+    for (const r of runsWithCtrl) {
+      const tNodes = Array.from(r.getElementsByTagNameNS(W_NS, "t"));
+      if (tNodes.length === 0) continue;
+      const combined = tNodes.map((t) => t.textContent || "").join("");
+      if (!combined.includes("{%")) continue;
+
+      const rPr = r.getElementsByTagNameNS(W_NS, "rPr")[0];
+      const segments = combined.split(/(\{%[\s\S]*?%\})/g).filter(Boolean);
+      const frag = doc.createDocumentFragment();
+
+      for (const seg of segments) {
+        if (/^\{%[\s\S]*?%\}$/.test(seg)) {
+          frag.appendChild(doc.createTextNode(seg));
+        } else {
+          const newR = doc.createElementNS(W_NS, "w:r");
+          if (rPr) newR.appendChild(rPr.cloneNode(true));
+          const newT = doc.createElementNS(W_NS, "w:t");
+          newT.setAttribute("xml:space", "preserve");
+          newT.textContent = seg;
+          newR.appendChild(newT);
+          frag.appendChild(newR);
+        }
+      }
+      r.parentNode.replaceChild(frag, r);
     }
 
     return new XMLSerializer().serializeToString(doc);
   }
 
   // =========================================================================
-  // 3. ESCAPE KONTEKS, INJEKSI GAMBAR & SANITASI AKHIR OPENXML
+  // 3. ESCAPE KONTEKS, PEMULIH TAG XML & SANITASI DOM AKHIR
   // =========================================================================
   function escapeContext(val) {
     if (val === null || val === undefined) return "";
     if (typeof val === "string") {
       if (val.startsWith("§§RAW:")) return val.slice(6);
-      // Gunakan token aman §§BR§§ agar tidak menyuntikkan tag XML mentah ke dalam string
       return escapeXml(val).replace(/\r?\n/g, "§§BR§§");
     }
     if (Array.isArray(val)) return val.map(escapeContext);
@@ -280,52 +363,160 @@
     }
   }
 
-  function enforceTableCantSplit(xmlString) {
-    return xmlString.replace(/<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/g, (match, inner) => {
-      if (!inner.includes("§§IMG:")) return match;
-      if (inner.includes("<w:trPr>")) {
-        return match.replace("<w:trPr>", "<w:trPr><w:cantSplit/>");
+  /**
+   * Memperbaiki ketidakseimbangan tag XML apabila template .docx memiliki blok
+   * {% if ... %} yang membentang melintasi batas sel tabel (<w:tc>) atau baris (<w:tr>).
+   */
+  function repairMismatchedXmlTags(xmlString) {
+    const tokenRegex = /<(\/?)([a-zA-Z0-9_:-]+)([^>]*)>/g;
+    const stack = [];
+    let out = "";
+    let lastIndex = 0;
+    let m;
+
+    while ((m = tokenRegex.exec(xmlString)) !== null) {
+      const [full, slash, tagName, attrs] = m;
+      out += xmlString.slice(lastIndex, m.index);
+      lastIndex = m.index + full.length;
+
+      // Lewati deklarasi <?xml ...?>, komentar <!-- -->, atau self-closing <tag .../>
+      if (tagName.startsWith("?") || tagName.startsWith("!") || attrs.endsWith("/")) {
+        out += full;
+        continue;
       }
-      return match.replace(/(<w:tr\b[^>]*>)/, "$1<w:trPr><w:cantSplit/></w:trPr>");
-    });
+
+      if (!slash) {
+        stack.push(tagName);
+        out += full;
+      } else {
+        const idx = stack.lastIndexOf(tagName);
+        if (idx === -1) {
+          // Tag penutup yatim tanpa pembuka -> buang
+          continue;
+        }
+        // Tutup semua tag di atasnya yang belum sempat ditutup sebelum tagName ditutup
+        while (stack.length - 1 > idx) {
+          const unclosed = stack.pop();
+          out += `</${unclosed}>`;
+        }
+        stack.pop();
+        out += full;
+      }
+    }
+    out += xmlString.slice(lastIndex);
+    while (stack.length > 0) {
+      out += `</${stack.pop()}>`;
+    }
+    return out;
   }
 
-  function replaceImageTokenInRuns(xmlString, token, drawingXml) {
-    return xmlString.replace(/<w:r\b[^>]*>[\s\S]*?<\/w:r>/g, (runXml) => {
-      if (!runXml.includes(token)) return runXml;
-
-      const rPrMatch = runXml.match(/<w:rPr>[\s\S]*?<\/w:rPr>/);
-      const rPr = rPrMatch ? rPrMatch[0] : "";
-
-      const textMatches = [...runXml.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g)];
-      const fullText = textMatches.map((m) => m[1]).join("");
-      const parts = fullText.split(token);
-
-      let outRuns = "";
-      for (let i = 0; i < parts.length; i++) {
-        if (parts[i]) {
-          outRuns += `<w:r>${rPr}<w:t xml:space="preserve">${parts[i]}</w:t></w:r>`;
-        }
-        if (i < parts.length - 1) {
-          outRuns += `<w:r>${drawingXml}</w:r>`;
-        }
-      }
-      return outRuns;
-    });
-  }
-
-  function sanitizeWordDom(xmlString, xmlPath) {
+  /**
+   * Sanitasi akhir menggunakan DOMParser:
+   * - Sisipkan tabel rekapitulasi bahan baku (§§TABEL_REKAP§§)
+   * - Sisipkan seluruh gambar (<w:drawing>) langsung ke dalam <w:r>
+   * - Konversi baris baru (§§BR§§) menjadi <w:br/>
+   * - Kunci baris tabel bergambar dengan <w:cantSplit/>
+   * - Pastikan seluruh <w:tc> dan <w:tr> memenuhi aturan wajib skema OpenXML Word
+   */
+  async function finalizeWordDom(xmlString, xmlPath, zip, imageJobs, allocRelId, docPrStart, addedExts, rekapXml) {
+    const repaired = repairMismatchedXmlTags(xmlString);
     const parser = new DOMParser();
-    const doc = parser.parseFromString(xmlString, "application/xml");
+    const doc = parser.parseFromString(repaired, "application/xml");
     const parseErr = doc.querySelector("parsererror");
     if (parseErr) {
       const msg = (parseErr.textContent || "").replace(/\s+/g, " ").trim().slice(0, 260);
       throw new Error(`Struktur XML tidak valid pada ${xmlPath}: ${msg}`);
     }
 
-    // 1. Konversi token §§BR§§ menjadi <w:br/> secara bersih di dalam <w:t>
-    const tNodes = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
-    for (const t of tNodes) {
+    let docPrCounter = docPrStart;
+
+    // 1. Ganti placeholder §§TABEL_REKAP§§ dengan elemen <w:tbl> asli
+    const walker = doc.createTreeWalker(doc.documentElement, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let curNode;
+    while ((curNode = walker.nextNode())) {
+      if (curNode.nodeValue && curNode.nodeValue.includes("§§TABEL_REKAP§§")) {
+        textNodes.push(curNode);
+      }
+    }
+    for (const tn of textNodes) {
+      const tblDoc = parser.parseFromString(rekapXml, "application/xml");
+      const importedTbl = doc.importNode(tblDoc.documentElement, true);
+      tn.parentNode.replaceChild(importedTbl, tn);
+    }
+
+    // 2. Sisipkan gambar (<w:drawing>) menggantikan token §§IMG:...§§ di dalam <w:t>
+    if (xmlPath === "word/document.xml" && imageJobs && imageJobs.size > 0) {
+      for (const [token, job] of imageJobs.entries()) {
+        const allT = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
+        const matchingT = allT.filter((t) => (t.textContent || "").includes(token));
+        if (matchingT.length === 0) continue;
+
+        const norm = await normalizeImageForWord(job.blob);
+        const natural = await getImageNaturalSize(job.blob).catch(() => ({ width: 400, height: 300 }));
+
+        let cx, cy;
+        const maxHeightMm = job.widthMm && job.widthMm <= 80 ? 105 : 210;
+        const maxCy = Math.round(maxHeightMm * EMU_PER_MM);
+
+        if (job.widthMm) {
+          cx = Math.round(job.widthMm * EMU_PER_MM);
+          cy = Math.round(cx * (natural.height / natural.width));
+          if (cy > maxCy) {
+            const ratio = maxCy / cy;
+            cx = Math.round(cx * ratio);
+            cy = maxCy;
+          }
+        } else {
+          cx = Math.round(natural.width * EMU_PER_PX_96DPI);
+          cy = Math.round(natural.height * EMU_PER_PX_96DPI);
+          const maxCx = 165 * EMU_PER_MM;
+          if (cx > maxCx) {
+            const ratio = maxCx / cx;
+            cx = Math.round(cx * ratio);
+            cy = Math.round(cy * ratio);
+          }
+          if (cy > maxCy) {
+            const ratio = maxCy / cy;
+            cx = Math.round(cx * ratio);
+            cy = maxCy;
+          }
+        }
+
+        const rId = allocRelId();
+        const docPrId = docPrCounter++;
+        const mediaFile = `media/img_${docPrId}.${norm.ext}`;
+        zip.file(`word/${mediaFile}`, norm.buffer);
+        addedExts.add(norm.ext);
+
+        const relTag = `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${mediaFile}"/>`;
+        imageJobs._newRels.push(relTag);
+
+        for (const tNode of matchingT) {
+          const runNode = findAncestor(tNode, "r");
+          if (!runNode) continue;
+          const parts = (tNode.textContent || "").split(token);
+          tNode.textContent = parts[0];
+          tNode.setAttribute("xml:space", "preserve");
+
+          let ref = tNode.nextSibling;
+          for (let i = 1; i < parts.length; i++) {
+            const drawingEl = createDrawingElement(doc, rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
+            runNode.insertBefore(drawingEl, ref);
+            if (parts[i]) {
+              const afterT = doc.createElementNS(W_NS, "w:t");
+              afterT.setAttribute("xml:space", "preserve");
+              afterT.textContent = parts[i];
+              runNode.insertBefore(afterT, ref);
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Konversi token §§BR§§ menjadi <w:br/>
+    const allTForBr = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
+    for (const t of allTForBr) {
       const txt = t.textContent || "";
       if (!txt.includes("§§BR§§")) continue;
       const lines = txt.split("§§BR§§");
@@ -343,15 +534,26 @@
       }
     }
 
-    // 2. Hapus <w:tr> yang tidak memiliki <w:tc>
+    // 4. Kunci baris tabel yang berisi gambar (<w:drawing>) agar tidak terbelah antar halaman
     const trList = Array.from(doc.getElementsByTagNameNS(W_NS, "tr"));
     for (const tr of trList) {
       if (tr.getElementsByTagNameNS(W_NS, "tc").length === 0) {
         tr.parentNode.removeChild(tr);
+        continue;
+      }
+      if (tr.getElementsByTagNameNS(W_NS, "drawing").length > 0) {
+        let trPr = tr.getElementsByTagNameNS(W_NS, "trPr")[0];
+        if (!trPr) {
+          trPr = doc.createElementNS(W_NS, "w:trPr");
+          tr.insertBefore(trPr, tr.firstChild);
+        }
+        if (trPr.getElementsByTagNameNS(W_NS, "cantSplit").length === 0) {
+          trPr.appendChild(doc.createElementNS(W_NS, "w:cantSplit"));
+        }
       }
     }
 
-    // 3. Setiap <w:tc> wajib memiliki minimal satu <w:p> dan tidak boleh diakhiri <w:tbl> tanpa <w:p>
+    // 5. Pastikan setiap <w:tc> memenuhi aturan skema OpenXML Word (minimal 1 <w:p> & tidak diakhiri <w:tbl>)
     const tcList = Array.from(doc.getElementsByTagNameNS(W_NS, "tc"));
     for (const tc of tcList) {
       if (tc.getElementsByTagNameNS(W_NS, "p").length === 0) {
@@ -383,11 +585,10 @@
     });
 
     const safeCtx = escapeContext(context);
-    if (Array.isArray(context.rekap_bahan_baku) && context.rekap_bahan_baku.length > 0) {
-      safeCtx.tabel_rekap = buildBahanBakuTableXml(context.rekap_bahan_baku);
-    } else {
-      safeCtx.tabel_rekap = "<w:p/>";
-    }
+    const rekapXml =
+      Array.isArray(context.rekap_bahan_baku) && context.rekap_bahan_baku.length > 0
+        ? buildBahanBakuTableXml(context.rekap_bahan_baku)
+        : `<w:p xmlns:w="${W_NS}"/>`;
 
     const relsPath = "word/_rels/document.xml.rels";
     let relsXml = await zip.file(relsPath).async("string");
@@ -403,6 +604,8 @@
     };
 
     const addedExts = new Set();
+    const jobs = imageJobs || new Map();
+    jobs._newRels = [];
 
     const xmlTargets = Object.keys(zip.files).filter(
       (p) => p === "word/document.xml" || /^word\/(header|footer)\d+\.xml$/.test(p)
@@ -412,7 +615,7 @@
       const rawXml = await zip.file(xmlPath).async("string");
 
       const existingDocPrIds = [...rawXml.matchAll(/<wp:docPr\b[^>]*\bid="(\d+)"/g)].map((m) => parseInt(m[1], 10));
-      let docPrCounter = (existingDocPrIds.length ? Math.max(...existingDocPrIds) : 100) + 10;
+      const docPrStart = (existingDocPrIds.length ? Math.max(...existingDocPrIds) : 100) + 10;
 
       const prepared = preprocessDocxDom(rawXml);
       const renderCtx = Object.assign({}, safeCtx);
@@ -425,62 +628,21 @@
         throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
       }
 
-      if (xmlPath === "word/document.xml") {
-        rendered = enforceTableCantSplit(rendered);
-      }
+      const finalized = await finalizeWordDom(
+        rendered,
+        xmlPath,
+        zip,
+        jobs,
+        allocRelId,
+        docPrStart,
+        addedExts,
+        rekapXml
+      );
+      zip.file(xmlPath, finalized);
+    }
 
-      if (xmlPath === "word/document.xml" && imageJobs && imageJobs.size > 0) {
-        for (const [token, job] of imageJobs.entries()) {
-          if (!rendered.includes(token)) continue;
-          const norm = await normalizeImageForWord(job.blob);
-          const natural = await getImageNaturalSize(job.blob).catch(() => ({ width: 400, height: 300 }));
-
-          let cx, cy;
-          const maxHeightMm = job.widthMm && job.widthMm <= 80 ? 105 : 210;
-          const maxCy = Math.round(maxHeightMm * EMU_PER_MM);
-
-          if (job.widthMm) {
-            cx = Math.round(job.widthMm * EMU_PER_MM);
-            cy = Math.round(cx * (natural.height / natural.width));
-            if (cy > maxCy) {
-              const ratio = maxCy / cy;
-              cx = Math.round(cx * ratio);
-              cy = maxCy;
-            }
-          } else {
-            cx = Math.round(natural.width * EMU_PER_PX_96DPI);
-            cy = Math.round(natural.height * EMU_PER_PX_96DPI);
-            const maxCx = 165 * EMU_PER_MM;
-            if (cx > maxCx) {
-              const ratio = maxCx / cx;
-              cx = Math.round(cx * ratio);
-              cy = Math.round(cy * ratio);
-            }
-            if (cy > maxCy) {
-              const ratio = maxCy / cy;
-              cx = Math.round(cx * ratio);
-              cy = maxCy;
-            }
-          }
-
-          const rId = allocRelId();
-          const docPrId = docPrCounter++;
-          const mediaFile = `media/img_${docPrId}.${norm.ext}`;
-          zip.file(`word/${mediaFile}`, norm.buffer);
-
-          relsXml = relsXml.replace(
-            "</Relationships>",
-            `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${mediaFile}"/></Relationships>`
-          );
-          addedExts.add(norm.ext);
-
-          const drawingXml = buildDrawingXml(rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
-          rendered = replaceImageTokenInRuns(rendered, token, drawingXml);
-        }
-      }
-
-      rendered = sanitizeWordDom(rendered, xmlPath);
-      zip.file(xmlPath, rendered);
+    if (jobs._newRels.length > 0) {
+      relsXml = relsXml.replace("</Relationships>", `${jobs._newRels.join("")}</Relationships>`);
     }
 
     for (const ext of addedExts) {

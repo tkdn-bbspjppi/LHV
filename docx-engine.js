@@ -146,10 +146,6 @@
     return cleanText(tagStr).replace(/\.length\b/g, " | length");
   }
 
-  /**
-   * Lepas pembungkus Content Control Word (<w:sdt> / <w:sdtContent>) sambil
-   * mempertahankan seluruh isi di dalamnya agar tidak pernah terpotong oleh tag Jinja.
-   */
   function unwrapContentControls(doc) {
     let sdts = Array.from(doc.getElementsByTagNameNS(W_NS, "sdt"));
     while (sdts.length > 0) {
@@ -176,10 +172,8 @@
       throw new Error(`Template XML rusak: ${parseErr.textContent}`);
     }
 
-    // 0. Lepas semua <w:sdt> agar tidak ada mismatch <w:sdtContent> vs <w:tc>
     unwrapContentControls(doc);
 
-    // 1. Gabungkan teks terpecah (<w:t>) di dalam tiap paragraf <w:p> dan bersihkan tag Jinja
     const paragraphs = Array.from(doc.getElementsByTagNameNS(W_NS, "p"));
     for (const p of paragraphs) {
       const tNodes = Array.from(p.getElementsByTagNameNS(W_NS, "t"));
@@ -216,7 +210,6 @@
       }
     }
 
-    // 2. Tangani tag baris tabel docxtpl: {% tr for ... %} dan {% tr endfor %}
     const rows = Array.from(doc.getElementsByTagNameNS(W_NS, "tr"));
     for (const tr of rows) {
       const tNodes = Array.from(tr.getElementsByTagNameNS(W_NS, "t"));
@@ -256,7 +249,8 @@
     if (val === null || val === undefined) return "";
     if (typeof val === "string") {
       if (val.startsWith("§§RAW:")) return val.slice(6);
-      return escapeXml(val).replace(/\r?\n/g, "</w:t><w:br/><w:t xml:space=\"preserve\">");
+      // Gunakan token aman §§BR§§ agar tidak menyuntikkan tag XML mentah ke dalam string
+      return escapeXml(val).replace(/\r?\n/g, "§§BR§§");
     }
     if (Array.isArray(val)) return val.map(escapeContext);
     if (typeof val === "object") {
@@ -329,7 +323,27 @@
       throw new Error(`Struktur XML tidak valid pada ${xmlPath}: ${msg}`);
     }
 
-    // 1. Hapus <w:tr> yang tidak memiliki <w:tc>
+    // 1. Konversi token §§BR§§ menjadi <w:br/> secara bersih di dalam <w:t>
+    const tNodes = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
+    for (const t of tNodes) {
+      const txt = t.textContent || "";
+      if (!txt.includes("§§BR§§")) continue;
+      const lines = txt.split("§§BR§§");
+      const parentRun = t.parentNode;
+      t.textContent = lines[0];
+      t.setAttribute("xml:space", "preserve");
+      let refNode = t.nextSibling;
+      for (let i = 1; i < lines.length; i++) {
+        const br = doc.createElementNS(W_NS, "w:br");
+        const nextT = doc.createElementNS(W_NS, "w:t");
+        nextT.setAttribute("xml:space", "preserve");
+        nextT.textContent = lines[i];
+        parentRun.insertBefore(br, refNode);
+        parentRun.insertBefore(nextT, refNode);
+      }
+    }
+
+    // 2. Hapus <w:tr> yang tidak memiliki <w:tc>
     const trList = Array.from(doc.getElementsByTagNameNS(W_NS, "tr"));
     for (const tr of trList) {
       if (tr.getElementsByTagNameNS(W_NS, "tc").length === 0) {
@@ -337,7 +351,7 @@
       }
     }
 
-    // 2. Setiap <w:tc> wajib memiliki minimal satu <w:p> dan tidak boleh diakhiri <w:tbl> tanpa <w:p>
+    // 3. Setiap <w:tc> wajib memiliki minimal satu <w:p> dan tidak boleh diakhiri <w:tbl> tanpa <w:p>
     const tcList = Array.from(doc.getElementsByTagNameNS(W_NS, "tc"));
     for (const tc of tcList) {
       if (tc.getElementsByTagNameNS(W_NS, "p").length === 0) {

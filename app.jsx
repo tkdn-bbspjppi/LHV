@@ -4,21 +4,369 @@ const logoKemenperin = 'assets/logo-kemenperin.png';
 const logoBBS = 'assets/logo-bbspjppi.png';
 
 // ==========================================
-// KOMPONEN HELPER: PRATINJAU DOKUMEN KECIL DENGAN INFO TARGET
+// MODAL PRATINJAU & CROP MANUAL PDF
 // ==========================================
-function ImagePreview({ file, targetWidth, uniform }) {
+function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
+  const [pages, setPages] = useState([]); // [{ pageNum, canvas, rect: {x,y,w,h}, included: true }]
+  const [activeIdx, setActiveIdx] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [dragState, setDragState] = useState(null);
+  const overlayRef = React.useRef(null);
+
+  function detectInitialCropRatio(canvas, formMode) {
+    const ctx = canvas.getContext('2d');
+    const { width, height } = canvas;
+    const data = ctx.getImageData(0, 0, width, height).data;
+    const mX = formMode ? Math.round(width * 0.03) : 4;
+    const mTop = formMode ? Math.round(height * 0.03) : 4;
+    const mBot = formMode ? Math.round(height * 0.94) : height - 4;
+
+    const rowInk = new Array(height).fill(0);
+    let minX = width, maxX = 0, found = false;
+
+    for (let y = mTop; y < mBot; y++) {
+      let count = 0;
+      for (let x = mX; x < width - mX; x++) {
+        const idx = (y * width + x) * 4;
+        if (data[idx + 3] > 10 && (data[idx] < 240 || data[idx + 1] < 240 || data[idx + 2] < 240)) {
+          count++;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          found = true;
+        }
+      }
+      rowInk[y] = count;
+    }
+
+    if (!found) return { x: 0.05, y: 0.05, w: 0.9, h: 0.9 };
+
+    let minY = mTop;
+    while (minY < mBot && rowInk[minY] < 3) minY++;
+
+    let maxY = minY;
+    if (formMode) {
+      let emptyRun = 0;
+      const gapThreshold = Math.round(height * 0.055);
+      for (let y = minY; y < mBot; y++) {
+        if (rowInk[y] >= 3) {
+          maxY = y;
+          emptyRun = 0;
+        } else {
+          emptyRun++;
+          if (emptyRun >= gapThreshold && maxY > minY + 100) break;
+        }
+      }
+    } else {
+      for (let y = mBot - 1; y >= minY; y--) {
+        if (rowInk[y] >= 3) { maxY = y; break; }
+      }
+    }
+
+    const pad = 16;
+    minX = Math.max(0, minX - pad);
+    minY = Math.max(0, minY - pad);
+    maxX = Math.min(width, maxX + pad);
+    maxY = Math.min(height, maxY + pad);
+
+    return {
+      x: minX / width,
+      y: minY / height,
+      w: Math.max(0.05, (maxX - minX) / width),
+      h: Math.max(0.05, (maxY - minY) / height),
+    };
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const buf = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        const loaded = [];
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+          const saved = initialRects && initialRects[i - 1];
+          const rect = saved ? { ...saved.rect } : detectInitialCropRatio(canvas, isFormulir);
+          const included = saved ? saved.included : true;
+          loaded.push({ pageNum: i, canvas, rect, included });
+        }
+        if (!cancelled) {
+          setPages(loaded);
+          setLoading(false);
+        }
+      } catch (err) {
+        alert('Gagal memuat pratinjau PDF: ' + err.message);
+        onClose();
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [file, isFormulir]);
+
+  const handlePointerDown = (e, mode) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setDragState({
+      mode,
+      startX: e.clientX,
+      startY: e.clientY,
+      origRect: { ...pages[activeIdx].rect },
+    });
+  };
+
+  useEffect(() => {
+    if (!dragState) return;
+    const onMove = (e) => {
+      const box = overlayRef.current && overlayRef.current.getBoundingClientRect();
+      if (!box) return;
+      const dx = (e.clientX - dragState.startX) / box.width;
+      const dy = (e.clientY - dragState.startY) / box.height;
+      const r = { ...dragState.origRect };
+
+      if (dragState.mode === 'move') {
+        r.x = Math.min(1 - r.w, Math.max(0, r.x + dx));
+        r.y = Math.min(1 - r.h, Math.max(0, r.y + dy));
+      } else {
+        if (dragState.mode.includes('w')) {
+          const newX = Math.min(r.x + r.w - 0.04, Math.max(0, r.x + dx));
+          r.w += r.x - newX;
+          r.x = newX;
+        }
+        if (dragState.mode.includes('e')) {
+          r.w = Math.min(1 - r.x, Math.max(0.04, r.w + dx));
+        }
+        if (dragState.mode.includes('n')) {
+          const newY = Math.min(r.y + r.h - 0.04, Math.max(0, r.y + dy));
+          r.h += r.y - newY;
+          r.y = newY;
+        }
+        if (dragState.mode.includes('s')) {
+          r.h = Math.min(1 - r.y, Math.max(0.04, r.h + dy));
+        }
+      }
+      setPages((prev) => prev.map((p, idx) => (idx === activeIdx ? { ...p, rect: r } : p)));
+    };
+    const onUp = () => setDragState(null);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [dragState, activeIdx]);
+
+  const applyRectToAll = () => {
+    const cur = { ...pages[activeIdx].rect };
+    setPages((prev) => prev.map((p) => ({ ...p, rect: { ...cur } })));
+  };
+
+  const resetAutoDetect = () => {
+    setPages((prev) =>
+      prev.map((p, idx) =>
+        idx === activeIdx ? { ...p, rect: detectInitialCropRatio(p.canvas, isFormulir) } : p
+      )
+    );
+  };
+
+  const handleSave = async () => {
+    const blobs = [];
+    const rectMeta = pages.map((p) => ({ rect: { ...p.rect }, included: p.included }));
+    for (const p of pages) {
+      if (!p.included) continue;
+      const sx = Math.round(p.rect.x * p.canvas.width);
+      const sy = Math.round(p.rect.y * p.canvas.height);
+      const sw = Math.max(10, Math.round(p.rect.w * p.canvas.width));
+      const sh = Math.max(10, Math.round(p.rect.h * p.canvas.height));
+
+      const out = document.createElement('canvas');
+      out.width = sw;
+      out.height = sh;
+      out.getContext('2d').drawImage(p.canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+      const blob = await new Promise((res) => out.toBlob(res, 'image/png'));
+      if (blob) blobs.push(blob);
+    }
+    if (blobs.length === 0) {
+      alert('Minimal 1 halaman harus dicentang untuk disertakan.');
+      return;
+    }
+    onSave(blobs, rectMeta);
+  };
+
+  const current = pages[activeIdx];
+
+  return (
+    <div style={{
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+      backgroundColor: 'rgba(0,0,0,0.72)', zIndex: 9999,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px'
+    }}>
+      <div style={{
+        backgroundColor: '#fff', borderRadius: '8px', width: '100%', maxWidth: '1020px',
+        height: '90vh', display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.35)'
+      }}>
+        {/* Header Modal */}
+        <div style={{
+          padding: '12px 20px', borderBottom: '1px solid #ddd',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px',
+          backgroundColor: '#f8fafc'
+        }}>
+          <div>
+            <div style={{ fontWeight: 'bold', fontSize: '15px', color: '#0d47a1' }}>✂️ Pratinjau & Atur Potongan (Crop) Halaman PDF</div>
+            <div style={{ fontSize: '12px', color: '#666' }}>{file.name} — Geser kotak biru atau tarik 4 titik sudutnya agar pas mengikuti pola dokumen</div>
+          </div>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button type="button" onClick={resetAutoDetect} style={{
+              padding: '7px 12px', fontSize: '12px', backgroundColor: '#fff', color: '#555',
+              border: '1px solid #ccc', borderRadius: '4px', cursor: 'pointer'
+            }}>
+              🔄 Deteksi Ulang Halaman Ini
+            </button>
+            {pages.length > 1 && (
+              <button type="button" onClick={applyRectToAll} style={{
+                padding: '7px 12px', fontSize: '12px', backgroundColor: '#e3f2fd', color: '#1565c0',
+                border: '1px solid #90caf9', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
+              }}>
+                📋 Terapkan ke Semua Halaman
+              </button>
+            )}
+            <button type="button" onClick={handleSave} disabled={loading} style={{
+              padding: '8px 16px', fontSize: '12px', backgroundColor: '#2e7d32', color: '#fff',
+              border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
+            }}>
+              ✓ Simpan Potongan ({pages.filter((p) => p.included).length} Hal)
+            </button>
+            <button type="button" onClick={onClose} style={{
+              padding: '6px 10px', fontSize: '14px', backgroundColor: '#ffebee', color: '#c62828',
+              border: '1px solid #ffcdd2', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
+            }}>
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {/* Body Modal */}
+        {loading ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#555', fontSize: '14px' }}>
+            ⏳ Merender halaman PDF untuk pratinjau...
+          </div>
+        ) : (
+          <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+            {/* Sidebar Daftar Halaman */}
+            <div style={{
+              width: '175px', borderRight: '1px solid #ddd', backgroundColor: '#f1f5f9',
+              overflowY: 'auto', padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px'
+            }}>
+              {pages.map((p, idx) => (
+                <div
+                  key={p.pageNum}
+                  onClick={() => setActiveIdx(idx)}
+                  style={{
+                    padding: '6px', borderRadius: '4px', cursor: 'pointer',
+                    border: idx === activeIdx ? '2px solid #1976d2' : '1px solid #cbd5e1',
+                    backgroundColor: idx === activeIdx ? '#e3f2fd' : '#fff',
+                    opacity: p.included ? 1 : 0.45
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', fontSize: '11px' }}>
+                    <span style={{ fontWeight: 'bold' }}>Hal. {p.pageNum}</span>
+                    <label onClick={(e) => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', gap: '3px', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={p.included}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setPages((prev) => prev.map((it, i) => (i === idx ? { ...it, included: checked } : it)));
+                        }}
+                      />
+                      <span>Pakai</span>
+                    </label>
+                  </div>
+                  <img src={p.canvas.toDataURL('image/jpeg', 0.45)} alt="" style={{ width: '100%', display: 'block', border: '1px solid #e2e8f0' }} />
+                </div>
+              ))}
+            </div>
+
+            {/* Area Kanvas Utama */}
+            <div style={{
+              flex: 1, backgroundColor: '#cbd5e1', overflow: 'auto',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px'
+            }}>
+              {current && (
+                <div ref={overlayRef} style={{ position: 'relative', display: 'inline-block', userSelect: 'none', boxShadow: '0 4px 16px rgba(0,0,0,0.25)' }}>
+                  <img
+                    src={current.canvas.toDataURL()}
+                    alt={`Halaman ${current.pageNum}`}
+                    style={{ maxHeight: '72vh', width: 'auto', display: 'block', pointerEvents: 'none' }}
+                  />
+                  {/* Kotak Seleksi Crop */}
+                  <div
+                    onPointerDown={(e) => handlePointerDown(e, 'move')}
+                    style={{
+                      position: 'absolute',
+                      left: `${current.rect.x * 100}%`,
+                      top: `${current.rect.y * 100}%`,
+                      width: `${current.rect.w * 100}%`,
+                      height: `${current.rect.h * 100}%`,
+                      border: '2px solid #1976d2',
+                      backgroundColor: 'rgba(25, 118, 210, 0.08)',
+                      boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.38)',
+                      cursor: 'move',
+                      boxSizing: 'border-box'
+                    }}
+                  >
+                    {['nw', 'ne', 'sw', 'se'].map((corner) => (
+                      <div
+                        key={corner}
+                        onPointerDown={(e) => handlePointerDown(e, corner)}
+                        style={{
+                          position: 'absolute',
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '50%',
+                          backgroundColor: '#1976d2',
+                          border: '2px solid #fff',
+                          top: corner.includes('n') ? '-7px' : undefined,
+                          bottom: corner.includes('s') ? '-7px' : undefined,
+                          left: corner.includes('w') ? '-7px' : undefined,
+                          right: corner.includes('e') ? '-7px' : undefined,
+                          cursor: (corner === 'nw' || corner === 'se') ? 'nwse-resize' : 'nesw-resize',
+                          boxShadow: '0 1px 3px rgba(0,0,0,0.4)'
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// KOMPONEN HELPER: PRATINJAU DOKUMEN KECIL DENGAN INFO TARGET & TOMBOL CROP PDF
+// ==========================================
+function ImagePreview({ file, targetWidth, uniform, customBlobs, onOpenCrop }) {
   const [url, setUrl] = useState('');
 
   useEffect(() => {
-    if (!file) return;
-    
-    // Membuat Object URL temporary untuk preview gambar
-    const objectUrl = URL.createObjectURL(file);
+    const target = (customBlobs && customBlobs[0]) || file;
+    if (!target || !target.type.startsWith('image/')) {
+      setUrl('');
+      return;
+    }
+    const objectUrl = URL.createObjectURL(target);
     setUrl(objectUrl);
-    
-    // Membersihkan memori saat file diganti atau dihapus
     return () => URL.revokeObjectURL(objectUrl);
-  }, [file]);
+  }, [file, customBlobs]);
 
   if (!file) return null;
 
@@ -26,38 +374,31 @@ function ImagePreview({ file, targetWidth, uniform }) {
   if (file.type.startsWith('image/')) {
     return (
       <div style={{ marginTop: '10px' }}>
-        <div style={{ 
-          display: 'flex', 
-          justifyContent: 'center', 
+        <div style={{
+          display: 'flex',
+          justifyContent: 'center',
           alignItems: 'center',
-          padding: '10px',
+          padding: '8px',
           backgroundColor: '#f8f9fa',
           border: '1px dashed #ccc',
           borderRadius: '6px',
-          width: 'fit-content' // Background menyesuaikan ukuran gambar
+          width: 'fit-content'
         }}>
-          <img 
-            src={url} 
-            alt="Preview Dokumen" 
-            style={uniform ? {
-              width: '120px', height: '120px',  // KUNCI: kotak persegi seragam, sama seperti hasil akhir
-              objectFit: 'contain',              // KUNCI: proporsional, tidak dipotong -- sama seperti disisipkan ke Word
-              backgroundColor: '#ffffff',
+          <img
+            src={url}
+            alt="Preview Dokumen"
+            style={{
+              maxWidth: '120px',
+              maxHeight: '120px',
+              objectFit: 'contain',
               display: 'block',
               borderRadius: '4px',
               boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-            } : { 
-              maxWidth: '120px',    // KUNCI: Lebar maksimal di layar 120px
-              maxHeight: '120px',   // KUNCI: Tinggi maksimal di layar 120px (agar cover tidak memanjang)
-              objectFit: 'contain', // KUNCI: Menjaga proporsi gambar tidak gepeng
-              display: 'block', 
-              borderRadius: '4px',
-              boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-            }} 
+            }}
           />
         </div>
         <span style={{ fontSize: '11px', color: uniform ? '#2e7d32' : '#1565c0', display: 'block', marginTop: '5px', fontWeight: 'bold' }}>
-          {uniform ? `📐 Diskalakan proporsional ke kotak seragam — pratinjau ini sesuai hasil akhir` : `↔️ Output Word dikunci: ${targetWidth}`}
+          {uniform ? `📐 Proporsional otomatis (tanpa kotak persegi paksa) — lebar: ${targetWidth}` : `↔️ Output Word dikunci: ${targetWidth}`}
         </span>
       </div>
     );
@@ -65,23 +406,46 @@ function ImagePreview({ file, targetWidth, uniform }) {
 
   // Jika file adalah PDF
   if (file.type === 'application/pdf') {
+    const hasCustom = Array.isArray(customBlobs) && customBlobs.length > 0;
     return (
-      <div style={{ 
-        maxWidth: '200px', 
-        padding: '10px', 
-        backgroundColor: '#e3f2fd', 
-        border: '1px solid #90caf9', 
-        borderRadius: '4px', 
-        marginTop: '8px', 
-        fontSize: '12px', 
-        color: '#0d47a1',
+      <div style={{
+        maxWidth: '340px',
+        padding: '10px',
+        backgroundColor: hasCustom ? '#e8f5e9' : '#e3f2fd',
+        border: `1px solid ${hasCustom ? '#81c784' : '#90caf9'}`,
+        borderRadius: '6px',
+        marginTop: '8px',
+        fontSize: '12px',
+        color: hasCustom ? '#1b5e20' : '#0d47a1',
         display: 'flex',
         flexDirection: 'column',
-        gap: '2px'
+        gap: '6px'
       }}>
-        <span style={{ fontWeight: 'bold' }}>📄 PDF Terdeteksi:</span>
-        <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>{file.name}</span>
-        <span style={{ fontSize: '11px', color: '#2e7d32', marginTop: '4px' }}>✓ Target Output Word: <strong>{targetWidth}</strong></span>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+          <div style={{ overflow: 'hidden' }}>
+            <div style={{ fontWeight: 'bold' }}>{hasCustom ? `✂️ PDF Terpotong (${customBlobs.length} hal)` : '📄 PDF Terdeteksi (Auto-Trim):'}</div>
+            <div style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', fontSize: '11px' }}>{file.name}</div>
+          </div>
+          {onOpenCrop && (
+            <button
+              type="button"
+              onClick={onOpenCrop}
+              style={{
+                padding: '6px 10px', fontSize: '11px', fontWeight: 'bold',
+                backgroundColor: hasCustom ? '#2e7d32' : '#1976d2', color: '#fff',
+                border: 'none', borderRadius: '4px', cursor: 'pointer', whiteSpace: 'nowrap'
+              }}
+            >
+              {hasCustom ? '✏️ Ubah Potongan' : '✂️ Pratinjau & Crop'}
+            </button>
+          )}
+        </div>
+        {hasCustom && url && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#fff', padding: '5px', borderRadius: '4px', border: '1px solid #c8e6c9' }}>
+            <img src={url} alt="Hasil Crop" style={{ maxHeight: '64px', maxWidth: '90px', objectFit: 'contain', border: '1px solid #eee' }} />
+            <span style={{ fontSize: '11px', color: '#2e7d32' }}>Pratinjau halaman 1 hasil crop • Target Word: <strong>{targetWidth}</strong></span>
+          </div>
+        )}
       </div>
     );
   }
@@ -130,8 +494,6 @@ function angkaKeTeks(n) {
   return String(n);
 }
 
-// Ubah nilai persentase (mis. "42.74" atau "42,74") jadi terbilang lengkap
-// dengan kata "persen" di akhir, mis: "empat puluh dua koma tujuh puluh empat persen"
 const DIGIT_KATA = ['nol', 'satu', 'dua', 'tiga', 'empat', 'lima', 'enam', 'tujuh', 'delapan', 'sembilan'];
 
 function nilaiKeTerbilangPersen(nilaiInput) {
@@ -146,9 +508,6 @@ function nilaiKeTerbilangPersen(nilaiInput) {
   let hasil = intPart === 0 ? 'nol' : angkaKeTeks(intPart);
 
   if (parts.length > 1 && parts[1] !== '' && parseInt(parts[1], 10) !== 0) {
-    // Desimal dibaca PER DIGIT (bukan sebagai angka puluhan), sesuai konvensi
-    // baku penulisan terbilang persentase -- mis. ",74" -> "tujuh empat"
-    // (bukan "tujuh puluh empat").
     const decWords = parts[1].split('').map((d) => DIGIT_KATA[parseInt(d, 10)] || 'nol').join(' ');
     hasil += ' koma ' + decWords;
   }
@@ -200,58 +559,59 @@ const MIME_DOKUMEN = ['image/png', 'image/jpeg', 'application/pdf'];
 const MIME_FORMULIR = ['image/png', 'image/jpeg', 'application/pdf', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel'];
 
 function App() {
-  const [activeTab, setActiveTab] = useState(1) // Buka Menu 1
-  const [status, setStatus] = useState('')
-  const [progressPercent, setProgressPercent] = useState(null) // null = tidak sedang generate; 0-100 = sedang berjalan
+  const [activeTab, setActiveTab] = useState(1);
+  const [status, setStatus] = useState('');
+  const [progressPercent, setProgressPercent] = useState(null);
+  const [cropModal, setCropModal] = useState(null);
+  const [customBlobsSingle, setCustomBlobsSingle] = useState({});
 
   // ==========================================
   // STATE MENU 1: DATA AWAL, COVER & LOGO
   // ==========================================
-  const [jenisLhv, setJenisLhv] = useState('Produksi Sendiri') 
-  const [namaPerusahaan, setNamaPerusahaan] = useState('')
-  const [tanggalLhv, setTanggalLhv] = useState('') 
-  const [fileCover, setFileCover] = useState(null)
-  const [coverMode, setCoverMode] = useState('auto') // 'auto' | 'upload'
-  const [coverColor, setCoverColor] = useState('#8e3d9c')
-  const [templateVarian, setTemplateVarian] = useState('tkdn-1')
-  // Pastikan templateVarian selalu valid untuk skema yang sedang dipilih —
-// mencegah bug "klik bmp-1 tapi preview-nya tkdn-1" akibat state lama
-// yang tidak sinkron dengan daftar opsi dropdown yang berubah.
-useEffect(() => {
-  const group = jenisLhv === 'BMP' ? 'bmp' : jenisLhv === 'Jasa' ? 'jasa' : 'tkdn';
-  const validList = (typeof CoverGenerator !== 'undefined' && CoverGenerator.TEMPLATES[group]) || [];
-  if (!validList.includes(templateVarian)) {
-    setTemplateVarian(validList[0] || '');
-  }
-}, [jenisLhv]);
-  const [kbliDeskripsi, setKbliDeskripsi] = useState('')
-  const [namaLembagaCover, setNamaLembagaCover] = useState('LVI BSKJI - Balai Besar Standardisasi dan Pelayanan Jasa Pencegahan Pencemaran Industri')
-  const [fileFotoCover, setFileFotoCover] = useState(null)
-  const [coverPreviewUrl, setCoverPreviewUrl] = useState('')
-  const [coverPreviewLoading, setCoverPreviewLoading] = useState(false)
-  const [fileLogo, setFileLogo] = useState(null)
-  const [fileFotoBarang, setFileFotoBarang] = useState(null)
-  const [fileFotoProdukUtama, setFileFotoProdukUtama] = useState(null)
+  const [jenisLhv, setJenisLhv] = useState('Produksi Sendiri');
+  const [namaPerusahaan, setNamaPerusahaan] = useState('');
+  const [tanggalLhv, setTanggalLhv] = useState('');
+  const [fileCover, setFileCover] = useState(null);
+  const [coverMode, setCoverMode] = useState('auto');
+  const [coverColor, setCoverColor] = useState('#8e3d9c');
+  const [templateVarian, setTemplateVarian] = useState('tkdn-1');
+
+  useEffect(() => {
+    const group = jenisLhv === 'BMP' ? 'bmp' : jenisLhv === 'Jasa' ? 'jasa' : 'tkdn';
+    const validList = (typeof CoverGenerator !== 'undefined' && CoverGenerator.TEMPLATES[group]) || [];
+    if (!validList.includes(templateVarian)) {
+      setTemplateVarian(validList[0] || '');
+    }
+  }, [jenisLhv]);
+
+  const [kbliDeskripsi, setKbliDeskripsi] = useState('');
+  const [namaLembagaCover, setNamaLembagaCover] = useState('LVI BSKJI - Balai Besar Standardisasi dan Pelayanan Jasa Pencegahan Pencemaran Industri');
+  const [fileFotoCover, setFileFotoCover] = useState(null);
+  const [coverPreviewUrl, setCoverPreviewUrl] = useState('');
+  const [coverPreviewLoading, setCoverPreviewLoading] = useState(false);
+  const [fileLogo, setFileLogo] = useState(null);
+  const [fileFotoBarang, setFileFotoBarang] = useState(null);
+  const [fileFotoProdukUtama, setFileFotoProdukUtama] = useState(null);
 
   // ==========================================
   // STATE MENU 2: RINGKASAN EKSEKUTIF
   // ==========================================
-  const [idBerkas, setIdBerkas] = useState('')
-  const [permenperin, setPermenperin] = useState('Peraturan Menteri Perindustrian Nomor 35 Tahun 2025 tentang Ketentuan dan Tata Cara Sertifikasi Tingkat Komponen Dalam Negeri dan Bobot Manfaat Perusahaan')
-  const [alamatKantor, setAlamatKantor] = useState('')
-  const [alamatPabrik, setAlamatPabrik] = useState('')
-  const [skalaPerusahaan, setSkalaPerusahaan] = useState('Menengah')
-  const [noIzin, setNoIzin] = useState('')
-  
+  const [idBerkas, setIdBerkas] = useState('');
+  const [permenperin, setPermenperin] = useState('Peraturan Menteri Perindustrian Nomor 35 Tahun 2025 tentang Ketentuan dan Tata Cara Sertifikasi Tingkat Komponen Dalam Negeri dan Bobot Manfaat Perusahaan');
+  const [alamatKantor, setAlamatKantor] = useState('');
+  const [alamatPabrik, setAlamatPabrik] = useState('');
+  const [skalaPerusahaan, setSkalaPerusahaan] = useState('Menengah');
+  const [noIzin, setNoIzin] = useState('');
+
   // -- STATE SKEMA KERJASAMA --
-  const [namaPerusahaanIndustri, setNamaPerusahaanIndustri] = useState('')
-  const [alamatPerusahaanIndustri, setAlamatPerusahaanIndustri] = useState('')
-  const [skalaPerusahaanIndustri, setSkalaPerusahaanIndustri] = useState('Menengah')
-  const [noIzinPerusahaanIndustri, setNoIzinPerusahaanIndustri] = useState('')
+  const [namaPerusahaanIndustri, setNamaPerusahaanIndustri] = useState('');
+  const [alamatPerusahaanIndustri, setAlamatPerusahaanIndustri] = useState('');
+  const [skalaPerusahaanIndustri, setSkalaPerusahaanIndustri] = useState('Menengah');
+  const [noIzinPerusahaanIndustri, setNoIzinPerusahaanIndustri] = useState('');
 
   // -- STATE SKEMA BMP --
-  const [nilaiBmp, setNilaiBmp] = useState('')
-  const [terbilangBmp, setTerbilangBmp] = useState('')
+  const [nilaiBmp, setNilaiBmp] = useState('');
+  const [terbilangBmp, setTerbilangBmp] = useState('');
   const [aspekBmp, setAspekBmp] = useState([
     { id: 1, teks: 'Legalitas dan operasional perusahaan', checked: true },
     { id: 2, teks: 'Penyerapan dan penggunaan tenaga kerja dalam negeri', checked: false },
@@ -269,30 +629,30 @@ useEffect(() => {
     { id: 14, teks: 'Penerapan Environmental, Social, and Governance (ESG)', checked: false },
     { id: 15, teks: 'Penghargaan', checked: false },
     { id: 16, teks: 'Kepatuhan pelaporan data industri di Sistem Industri Nasional (SIINas)', checked: false }
-  ])
+  ]);
 
-  const [tglVerifikasiDok, setTglVerifikasiDok] = useState('')
-  const [tglVerifikasiLapangan, setTglVerifikasiLapangan] = useState('')
-  const [kbli, setKbli] = useState('')
-  const [kapasitasProduksi, setKapasitasProduksi] = useState('')
-  const [jenisBarang, setJenisBarang] = useState('')
-  const [tipeBarang, setTipeBarang] = useState('')
-  const [spesifikasiBarang, setSpesifikasiBarang] = useState('')
-  const [kodeHs, setKodeHs] = useState('')
-  const [merekBarang, setMerekBarang] = useState('')
-  const [kelompokBarang, setKelompokBarang] = useState('')
-  const [nilaiTkdn, setNilaiTkdn] = useState('')
-  const [terbilangTkdn, setTerbilangTkdn] = useState('')
-  const [nilaiBrainware, setNilaiBrainware] = useState('')
-  const [terbilangBrainware, setTerbilangBrainware] = useState('')
+  const [tglVerifikasiDok, setTglVerifikasiDok] = useState('');
+  const [tglVerifikasiLapangan, setTglVerifikasiLapangan] = useState('');
+  const [kbli, setKbli] = useState('');
+  const [kapasitasProduksi, setKapasitasProduksi] = useState('');
+  const [jenisBarang, setJenisBarang] = useState('');
+  const [tipeBarang, setTipeBarang] = useState('');
+  const [spesifikasiBarang, setSpesifikasiBarang] = useState('');
+  const [kodeHs, setKodeHs] = useState('');
+  const [merekBarang, setMerekBarang] = useState('');
+  const [kelompokBarang, setKelompokBarang] = useState('');
+  const [nilaiTkdn, setNilaiTkdn] = useState('');
+  const [terbilangTkdn, setTerbilangTkdn] = useState('');
+  const [nilaiBrainware, setNilaiBrainware] = useState('');
+  const [terbilangBrainware, setTerbilangBrainware] = useState('');
 
   // --- PENGESAHAN LAPORAN ---
-  const [namaVerifikator, setNamaVerifikator] = useState('')
-  const [nipVerifikator, setNipVerifikator] = useState('')
-  const [fileTtdVerifikator, setFileTtdVerifikator] = useState(null)
-  const [pejabatMengetahui, setPejabatMengetahui] = useState('')
-  const [namaPejabat, setNamaPejabat] = useState('') 
-  const [nipPejabat, setNipPejabat] = useState('')
+  const [namaVerifikator, setNamaVerifikator] = useState('');
+  const [nipVerifikator, setNipVerifikator] = useState('');
+  const [fileTtdVerifikator, setFileTtdVerifikator] = useState(null);
+  const [pejabatMengetahui, setPejabatMengetahui] = useState('');
+  const [namaPejabat, setNamaPejabat] = useState('');
+  const [nipPejabat, setNipPejabat] = useState('');
 
   // --- ACUAN PERATURAN ---
   const [acuanPeraturan, setAcuanPeraturan] = useState([
@@ -306,29 +666,28 @@ useEffect(() => {
     { id: 4, type: 'fixed', aturan: 'Peraturan Sekretaris Jenderal Kementerian Perindustrian Nomor 5 Tahun 2025 tentang Petunjuk Teknis Penghitungan Nilai TKDN Barang dan Jasa Industri' },
     { id: 5, type: 'fixed', aturan: 'Keputusan Kepala Badan Standardisasi dan Kebijakan Jasa Industri Tahun 2026 tentang Pedoman Penyelenggaraan Layanan Penghitungan dan Verifikasi Nilai Tingkat Komponen Dalam Negeri dan Bobot Manfaat Perusahaan di Lingkungan Badan Standardisasi dan Kebijakan Jasa Industri' },
     { id: 6, type: 'dropdown', aturan: 'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri', options: [
-      'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Kementerian Perindustrian Nomor 2 Tahun 2026 tentang Perubahan atas Peraturan Direahuan Dirjen ILMATE Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
+      'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Kementerian Perindustrian Nomor 2 Tahun 2026 tentang Perubahan atas Peraturan Dirjen ILMATE Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
       'Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 113 Tahun 2026 tentang Perubahan atas Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 263 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKMA untuk Penghitungan TKDN',
       'Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 8 Tahun 2026 tentang Perubahan atas Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKFT untuk Penghitungan Nilai TKDN',
       'Peraturan Direktur Jenderal Industri Agro Nomor 2 Tahun 2026 tentang Perubahan atas Peraturan Direktur Jenderal Industri Agro Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Agro untuk Penghitungan Nilai TKDN'
     ]}
-  ])
+  ]);
 
   // ==========================================
   // STATE MENU 3: HASIL VERIFIKASI (DINAMIS)
   // ==========================================
-  const [formulirVerifikasi, setFormulirVerifikasi] = useState([])
-  const [modeFormulir, setModeFormulir] = useState('perItem') // 'perItem' | 'gabungan'
-  const [fileFormulirGabungan, setFileFormulirGabungan] = useState(null)
+  const [formulirVerifikasi, setFormulirVerifikasi] = useState([]);
+  const [modeFormulir, setModeFormulir] = useState('perItem');
+  const [fileFormulirGabungan, setFileFormulirGabungan] = useState(null);
 
   // ==========================================
   // STATE MENU 4: DOKUMEN PENDUKUNG
   // ==========================================
-  const [teleponKantor, setTeleponKantor] = useState(''); const [faxKantor, setFaxKantor] = useState(''); const [emailKantor, setEmailKantor] = useState(''); const [websiteKantor, setWebsiteKantor] = useState(''); const [statusKantor, setStatusKantor] = useState('PMDN'); const [picKantor, setPicKantor] = useState(''); const [aktaKantor, setAktaKantor] = useState(''); const [npwpKantor, setNpwpKantor] = useState('')
-  const [teleponPabrik, setTeleponPabrik] = useState(''); const [faxPabrik, setFaxPabrik] = useState(''); const [emailPabrik, setEmailPabrik] = useState(''); const [websitePabrik, setWebsitePabrik] = useState(''); const [statusPabrik, setStatusPabrik] = useState('PMDN'); const [picPabrik, setPicPabrik] = useState(''); const [aktaPabrik, setAktaPabrik] = useState(''); const [npwpPabrik, setNpwpPabrik] = useState('')
+  const [teleponKantor, setTeleponKantor] = useState(''); const [faxKantor, setFaxKantor] = useState(''); const [emailKantor, setEmailKantor] = useState(''); const [websiteKantor, setWebsiteKantor] = useState(''); const [statusKantor, setStatusKantor] = useState('PMDN'); const [picKantor, setPicKantor] = useState(''); const [aktaKantor, setAktaKantor] = useState(''); const [npwpKantor, setNpwpKantor] = useState('');
+  const [teleponPabrik, setTeleponPabrik] = useState(''); const [faxPabrik, setFaxPabrik] = useState(''); const [emailPabrik, setEmailPabrik] = useState(''); const [websitePabrik, setWebsitePabrik] = useState(''); const [statusPabrik, setStatusPabrik] = useState('PMDN'); const [picPabrik, setPicPabrik] = useState(''); const [aktaPabrik, setAktaPabrik] = useState(''); const [npwpPabrik, setNpwpPabrik] = useState('');
   
-  const [teleponKantorIndustri, setTeleponKantorIndustri] = useState(''); const [faxKantorIndustri, setFaxKantorIndustri] = useState(''); const [emailKantorIndustri, setEmailKantorIndustri] = useState(''); const [websiteKantorIndustri, setWebsiteKantorIndustri] = useState(''); const [statusKantorIndustri, setStatusKantorIndustri] = useState('PMDN'); const [picKantorIndustri, setPicKantorIndustri] = useState(''); const [aktaKantorIndustri, setAktaKantorIndustri] = useState(''); const [npwpKantorIndustri, setNpwpKantorIndustri] = useState('')
+  const [teleponKantorIndustri, setTeleponKantorIndustri] = useState(''); const [faxKantorIndustri, setFaxKantorIndustri] = useState(''); const [emailKantorIndustri, setEmailKantorIndustri] = useState(''); const [websiteKantorIndustri, setWebsiteKantorIndustri] = useState(''); const [statusKantorIndustri, setStatusKantorIndustri] = useState('PMDN'); const [picKantorIndustri, setPicKantorIndustri] = useState(''); const [aktaKantorIndustri, setAktaKantorIndustri] = useState(''); const [npwpKantorIndustri, setNpwpKantorIndustri] = useState('');
 
-  // SINKRONISASI PABRIK DAN KANTOR
   const [samaDenganKantor, setSamaDenganKantor] = useState(false);
 
   useEffect(() => {
@@ -345,75 +704,71 @@ useEffect(() => {
     }
   }, [samaDenganKantor, statusKantor, alamatKantor, teleponKantor, faxKantor, emailKantor, websiteKantor, picKantor, aktaKantor, npwpKantor]);
 
-  const [fileStruktur, setFileStruktur] = useState(null)
-  const [fileAlurProduksi, setFileAlurProduksi] = useState(null)
-  const [fileStrukturIndustri, setFileStrukturIndustri] = useState(null) 
-  
-  const [fileBuktiPabrik, setFileBuktiPabrik] = useState([{ id: 1, file: null, keterangan: '' }])
-  const [fileBom, setFileBom] = useState([{ id: 2, file: null, keterangan: '' }])
-  const [fileSertifikatTkdn, setFileSertifikatTkdn] = useState([{ id: 3, file: null, keterangan: '' }])
-  const [fileBuktiBeli, setFileBuktiBeli] = useState([{ id: 4, file: null, keterangan: '' }])
-  const [fileKtp, setFileKtp] = useState([{ id: 5, file: null, keterangan: '' }])
-  const [fileBuktiKerjasama, setFileBuktiKerjasama] = useState([{ id: 6, file: null, keterangan: 'Bukti Kerjasama' }]) 
+  const [fileStruktur, setFileStruktur] = useState(null);
+  const [fileAlurProduksi, setFileAlurProduksi] = useState(null);
+  const [fileStrukturIndustri, setFileStrukturIndustri] = useState(null);
 
-  const [fileTenagaKerjaBmp, setFileTenagaKerjaBmp] = useState([{ id: 401, file: null, keterangan: 'Bukti Penyerapan Tenaga Kerja' }])
-  const [fileInvestasiBmp, setFileInvestasiBmp] = useState([{ id: 402, file: null, keterangan: 'Bukti Penambahan Investasi Baru' }])
-  const [fileKemitraanBmp, setFileKemitraanBmp] = useState([{ id: 403, file: null, keterangan: 'Bukti Kemitraan Rantai Pasok' }])
-  const [fileSubstitusiBmp, setFileSubstitusiBmp] = useState([{ id: 404, file: null, keterangan: 'Bukti Industri Pionir / Substitusi Impor' }])
-  const [fileMesinDnBmp, setFileMesinDnBmp] = useState([{ id: 405, file: null, keterangan: 'Bukti Mesin Peralatan DN' }])
-  const [fileLokasiBmp, setFileLokasiBmp] = useState([{ id: 406, file: null, keterangan: 'Bukti Lokasi Produksi' }])
-  const [fileI40Bmp, setFileI40Bmp] = useState([{ id: 407, file: null, keterangan: 'Bukti Penerapan Industri 4.0' }])
-  const [fileSdmBmp, setFileSdmBmp] = useState([{ id: 408, file: null, keterangan: 'Bukti Pengembangan SDM Industri' }])
-  const [fileSertifikatBmp, setFileSertifikatBmp] = useState([{ id: 409, file: null, keterangan: 'Bukti Kepemilikan Sertifikat/Akreditasi' }])
-  const [fileHijauBmp, setFileHijauBmp] = useState([{ id: 410, file: null, keterangan: 'Bukti Penerapan Industri Hijau' }])
-  const [fileEksporBmp, setFileEksporBmp] = useState([{ id: 411, file: null, keterangan: 'Bukti Nilai Ekspor' }])
-  const [fileMerekDnBmp, setFileMerekDnBmp] = useState([{ id: 412, file: null, keterangan: 'Bukti Kepemilikan Merek DN' }])
-  const [fileEsgBmp, setFileEsgBmp] = useState([{ id: 413, file: null, keterangan: 'Bukti Penerapan ESG' }])
-  const [fileAwardsBmp, setFileAwardsBmp] = useState([{ id: 414, file: null, keterangan: 'Bukti Penghargaan / Awards' }])
-  const [fileSiinasBmp, setFileSiinasBmp] = useState([{ id: 415, file: null, keterangan: 'Bukti Kepatuhan SIINas' }])
+  const [fileBuktiPabrik, setFileBuktiPabrik] = useState([{ id: 1, file: null, keterangan: '' }]);
+  const [fileBom, setFileBom] = useState([{ id: 2, file: null, keterangan: '' }]);
+  const [fileSertifikatTkdn, setFileSertifikatTkdn] = useState([{ id: 3, file: null, keterangan: '' }]);
+  const [fileBuktiBeli, setFileBuktiBeli] = useState([{ id: 4, file: null, keterangan: '' }]);
+  const [fileKtp, setFileKtp] = useState([{ id: 5, file: null, keterangan: '' }]);
+  const [fileBuktiKerjasama, setFileBuktiKerjasama] = useState([{ id: 6, file: null, keterangan: 'Bukti Kerjasama' }]);
+
+  const [fileTenagaKerjaBmp, setFileTenagaKerjaBmp] = useState([{ id: 401, file: null, keterangan: 'Bukti Penyerapan Tenaga Kerja' }]);
+  const [fileInvestasiBmp, setFileInvestasiBmp] = useState([{ id: 402, file: null, keterangan: 'Bukti Penambahan Investasi Baru' }]);
+  const [fileKemitraanBmp, setFileKemitraanBmp] = useState([{ id: 403, file: null, keterangan: 'Bukti Kemitraan Rantai Pasok' }]);
+  const [fileSubstitusiBmp, setFileSubstitusiBmp] = useState([{ id: 404, file: null, keterangan: 'Bukti Industri Pionir / Substitusi Impor' }]);
+  const [fileMesinDnBmp, setFileMesinDnBmp] = useState([{ id: 405, file: null, keterangan: 'Bukti Mesin Peralatan DN' }]);
+  const [fileLokasiBmp, setFileLokasiBmp] = useState([{ id: 406, file: null, keterangan: 'Bukti Lokasi Produksi' }]);
+  const [fileI40Bmp, setFileI40Bmp] = useState([{ id: 407, file: null, keterangan: 'Bukti Penerapan Industri 4.0' }]);
+  const [fileSdmBmp, setFileSdmBmp] = useState([{ id: 408, file: null, keterangan: 'Bukti Pengembangan SDM Industri' }]);
+  const [fileSertifikatBmp, setFileSertifikatBmp] = useState([{ id: 409, file: null, keterangan: 'Bukti Kepemilikan Sertifikat/Akreditasi' }]);
+  const [fileHijauBmp, setFileHijauBmp] = useState([{ id: 410, file: null, keterangan: 'Bukti Penerapan Industri Hijau' }]);
+  const [fileEksporBmp, setFileEksporBmp] = useState([{ id: 411, file: null, keterangan: 'Bukti Nilai Ekspor' }]);
+  const [fileMerekDnBmp, setFileMerekDnBmp] = useState([{ id: 412, file: null, keterangan: 'Bukti Kepemilikan Merek DN' }]);
+  const [fileEsgBmp, setFileEsgBmp] = useState([{ id: 413, file: null, keterangan: 'Bukti Penerapan ESG' }]);
+  const [fileAwardsBmp, setFileAwardsBmp] = useState([{ id: 414, file: null, keterangan: 'Bukti Penghargaan / Awards' }]);
+  const [fileSiinasBmp, setFileSiinasBmp] = useState([{ id: 415, file: null, keterangan: 'Bukti Kepatuhan SIINas' }]);
 
   // ==========================================
   // STATE MENU 5: LAMPIRAN
   // ==========================================
-  const [fileDokumenPengembangan, setFileDokumenPengembangan] = useState([{ id: 100, file: null, keterangan: 'Dokumen Pengembangan' }])
-  const [fileAktaPendirian, setFileAktaPendirian] = useState([{ id: 121, file: null, keterangan: 'Akta Pendirian/Perubahan Terakhir' }])
-  const [fileNibRba, setFileNibRba] = useState([{ id: 101, file: null, keterangan: 'NIB RBA' }])
-  const [fileSertifikatStandar, setFileSertifikatStandar] = useState([{ id: 102, file: null, keterangan: 'Sertifikat Standar' }])
-  const [fileIzinUsaha, setFileIzinUsaha] = useState([{ id: 103, file: null, keterangan: 'Izin Usaha' }])
-  const [fileNpwpLampiran, setFileNpwpLampiran] = useState([{ id: 104, file: null, keterangan: 'NPWP' }])
-  const [fileSertifikatMerek, setFileSertifikatMerek] = useState([{ id: 105, file: null, keterangan: 'Sertifikat Merek' }])
-  const [fileSertifikatProduk, setFileSertifikatProduk] = useState([{ id: 106, file: null, keterangan: 'Sertifikat Produk' }])
-  const [fileNie, setFileNie] = useState([{ id: 107, file: null, keterangan: 'NIE' }])
-  const [fileBpom, setFileBpom] = useState([{ id: 108, file: null, keterangan: 'BPOM' }])
-  
-  const [fileFotoProduk, setFileFotoProduk] = useState([{ id: 109, file: null, keterangan: 'Foto Produk' }])
-  const [fileFotoBahanBaku, setFileFotoBahanBaku] = useState([{ id: 110, file: null, keterangan: 'Foto Bahan Baku' }])
-  const [fileInvoiceBahanBaku, setFileInvoiceBahanBaku] = useState([{ id: 111, file: null, keterangan: 'Invoice Bahan Baku' }])
-  const [fileAlurProsesLampiran, setFileAlurProsesLampiran] = useState([{ id: 112, file: null, keterangan: 'Alur Proses Produksi' }])
-  
-  const [fileDaftarGaji, setFileDaftarGaji] = useState([{ id: 113, file: null, keterangan: 'Daftar Gaji' }])
-  const [fileSampelKtp, setFileSampelKtp] = useState([{ id: 114, file: null, keterangan: 'KTP Karyawan' }])
-  const [fileStrukturPabrik, setFileStrukturPabrik] = useState([{ id: 115, file: null, keterangan: 'Struktur Pabrik' }])
-  const [fileFotoMesin, setFileFotoMesin] = useState([{ id: 116, file: null, keterangan: 'Foto Mesin' }])
-  const [fileDaftarPenyusutan, setFileDaftarPenyusutan] = useState([{ id: 117, file: null, keterangan: 'Daftar Penyusutan' }])
-  const [fileBuktiListrik, setFileBuktiListrik] = useState([{ id: 118, file: null, keterangan: 'Bukti Pembayaran Listrik' }])
-  const [fileAktaSewa, setFileAktaSewa] = useState([{ id: 119, file: null, keterangan: 'Akta Sewa Tempat' }])
-  
-  const [fileGeotagging, setFileGeotagging] = useState([{ id: 120, file: null, keterangan: 'Dokumen Kunjungan (Geotagging)' }])
-  const [rekapBahanBaku, setRekapBahanBaku] = useState([{ id: 1, nama_bahan: '', produsen: '', asal: 'DN' }])
-  const [modeRekapBahanBaku, setModeRekapBahanBaku] = useState('tabel') // 'tabel' | 'upload'
-  const [layoutGambar, setLayoutGambar] = useState('2') // '1' | '2' | '4'
-  const [fileRekapBahanBaku, setFileRekapBahanBaku] = useState(null)
+  const [fileDokumenPengembangan, setFileDokumenPengembangan] = useState([{ id: 100, file: null, keterangan: 'Dokumen Pengembangan' }]);
+  const [fileAktaPendirian, setFileAktaPendirian] = useState([{ id: 121, file: null, keterangan: 'Akta Pendirian/Perubahan Terakhir' }]);
+  const [fileNibRba, setFileNibRba] = useState([{ id: 101, file: null, keterangan: 'NIB RBA' }]);
+  const [fileSertifikatStandar, setFileSertifikatStandar] = useState([{ id: 102, file: null, keterangan: 'Sertifikat Standar' }]);
+  const [fileIzinUsaha, setFileIzinUsaha] = useState([{ id: 103, file: null, keterangan: 'Izin Usaha' }]);
+  const [fileNpwpLampiran, setFileNpwpLampiran] = useState([{ id: 104, file: null, keterangan: 'NPWP' }]);
+  const [fileSertifikatMerek, setFileSertifikatMerek] = useState([{ id: 105, file: null, keterangan: 'Sertifikat Merek' }]);
+  const [fileSertifikatProduk, setFileSertifikatProduk] = useState([{ id: 106, file: null, keterangan: 'Sertifikat Produk' }]);
+  const [fileNie, setFileNie] = useState([{ id: 107, file: null, keterangan: 'NIE' }]);
+  const [fileBpom, setFileBpom] = useState([{ id: 108, file: null, keterangan: 'BPOM' }]);
+
+  const [fileFotoProduk, setFileFotoProduk] = useState([{ id: 109, file: null, keterangan: 'Foto Produk' }]);
+  const [fileFotoBahanBaku, setFileFotoBahanBaku] = useState([{ id: 110, file: null, keterangan: 'Foto Bahan Baku' }]);
+  const [fileInvoiceBahanBaku, setFileInvoiceBahanBaku] = useState([{ id: 111, file: null, keterangan: 'Invoice Bahan Baku' }]);
+  const [fileAlurProsesLampiran, setFileAlurProsesLampiran] = useState([{ id: 112, file: null, keterangan: 'Alur Proses Produksi' }]);
+
+  const [fileDaftarGaji, setFileDaftarGaji] = useState([{ id: 113, file: null, keterangan: 'Daftar Gaji' }]);
+  const [fileSampelKtp, setFileSampelKtp] = useState([{ id: 114, file: null, keterangan: 'KTP Karyawan' }]);
+  const [fileStrukturPabrik, setFileStrukturPabrik] = useState([{ id: 115, file: null, keterangan: 'Struktur Pabrik' }]);
+  const [fileFotoMesin, setFileFotoMesin] = useState([{ id: 116, file: null, keterangan: 'Foto Mesin' }]);
+  const [fileDaftarPenyusutan, setFileDaftarPenyusutan] = useState([{ id: 117, file: null, keterangan: 'Daftar Penyusutan' }]);
+  const [fileBuktiListrik, setFileBuktiListrik] = useState([{ id: 118, file: null, keterangan: 'Bukti Pembayaran Listrik' }]);
+  const [fileAktaSewa, setFileAktaSewa] = useState([{ id: 119, file: null, keterangan: 'Akta Sewa Tempat' }]);
+
+  const [fileGeotagging, setFileGeotagging] = useState([{ id: 120, file: null, keterangan: 'Dokumen Kunjungan (Geotagging)' }]);
+  const [rekapBahanBaku, setRekapBahanBaku] = useState([{ id: 1, nama_bahan: '', produsen: '', asal: 'DN' }]);
+  const [modeRekapBahanBaku, setModeRekapBahanBaku] = useState('tabel');
+  const [layoutGambar, setLayoutGambar] = useState('2');
+  const [fileRekapBahanBaku, setFileRekapBahanBaku] = useState(null);
 
   // ==========================================
-  // ==========================================
   // FITUR SIMPAN OTOMATIS (AUTO-SAVE) KE INDEXEDDB
-  // Menyimpan SEMUA isian form -- termasuk foto & dokumen yang sudah
-  // diupload -- supaya kalau tab browser tertutup/refresh tidak sengaja,
-  // pekerjaan verifikator tidak hilang. (localStorage lama tidak dipakai
-  // lagi di sini karena tidak bisa menyimpan file.)
   // ==========================================
   const allSetters = {
+    customBlobsSingle: setCustomBlobsSingle,
     jenisLhv: setJenisLhv,
     coverMode: setCoverMode,
     coverColor: setCoverColor,
@@ -541,6 +896,7 @@ useEffect(() => {
   };
 
   const buildFullState = () => ({
+    customBlobsSingle,
     jenisLhv, namaPerusahaan, tanggalLhv, idBerkas, permenperin,
     coverMode, coverColor, kbliDeskripsi, namaLembagaCover, fileFotoCover,
     skalaPerusahaan, noIzin,
@@ -557,12 +913,22 @@ useEffect(() => {
     statusKantor, picKantor, aktaKantor, npwpKantor,
     alamatPabrik, teleponPabrik, faxPabrik, emailPabrik, websitePabrik,
     statusPabrik, picPabrik, aktaPabrik, npwpPabrik,
-    rekapBahanBaku, modeRekapBahanBaku, fileRekapBahanBaku, layoutGambar, acuanPeraturan, samaDenganKantor,
-    fileCover, fileLogo, fileTtdVerifikator, fileStruktur, fileAlurProduksi,
+    rekapBahanBaku, modeRekapBahanBaku,
+    fileRekapBahanBaku,
+    customBlobsRekap: customBlobsSingle.rekapBahanBaku?.blobs || null,
+    layoutGambar, acuanPeraturan, samaDenganKantor,
+    fileCover, fileLogo, fileTtdVerifikator,
+    fileStruktur, customBlobsStruktur: customBlobsSingle.struktur?.blobs || null,
+    fileAlurProduksi, customBlobsAlurProduksi: customBlobsSingle.alurProduksi?.blobs || null,
     fileFotoBarang, fileFotoProdukUtama,
-    fileStrukturIndustri,
+    fileStrukturIndustri, customBlobsStrukturIndustri: customBlobsSingle.strukturIndustri?.blobs || null,
     formulirVerifikasi: modeFormulir === 'gabungan'
-      ? [{ id: 1, judul: 'Formulir Verifikasi (Dokumen Gabungan)', file: fileFormulirGabungan }]
+      ? [{
+          id: 1,
+          judul: 'Formulir Verifikasi (Dokumen Gabungan)',
+          file: fileFormulirGabungan,
+          customBlobs: customBlobsSingle.formulirGabungan?.blobs || null
+        }]
       : formulirVerifikasi,
     fileBuktiPabrik, fileBom, fileSertifikatTkdn, fileBuktiBeli, fileKtp,
     fileBuktiKerjasama,
@@ -578,17 +944,15 @@ useEffect(() => {
     fileGeotagging
   });
 
-  // Ref selalu menunjuk ke state TERBARU, dipakai oleh autosave berkala
-  // supaya tidak perlu daftar dependency yang sangat panjang di useEffect.
   const latestStateRef = React.useRef(null);
   latestStateRef.current = buildFullState();
 
-  const [draftInfo, setDraftInfo] = useState(null); // { savedAt } | null
+  const [draftInfo, setDraftInfo] = useState(null);
   const draftSavingRef = React.useRef(false);
 
   const saveDraft = async () => {
     if (window.isResetting) return;
-    if (draftSavingRef.current) return; // hindari tumpang tindih simpanan
+    if (draftSavingRef.current) return;
     draftSavingRef.current = true;
     try {
       await LHVLogic.dbSaveDraft(latestStateRef.current);
@@ -612,11 +976,11 @@ useEffect(() => {
   const generateDefaultForms = (aturan) => {
     let jumlah = aturan.includes('31 Tahun 2022') ? 15 : aturan.includes('22 Tahun 2020') ? 12 : 4;
     setFormulirVerifikasi(Array.from({ length: jumlah }, (_, i) => ({ id: Date.now() + i, judul: `Formulir 1.${i + 1}`, file: null })));
-  }
+  };
 
-  // Muat draft (kalau ada) saat aplikasi pertama dibuka
   useEffect(() => {
     let loadedPermenperin = permenperin;
+    let hasSavedForms = false;
     (async () => {
       try {
         const rec = await LHVLogic.dbLoadDraft();
@@ -626,17 +990,18 @@ useEffect(() => {
             if (d[key] !== undefined && d[key] !== null) allSetters[key](d[key]);
           });
           if (d.permenperin) loadedPermenperin = d.permenperin;
+          if (Array.isArray(d.formulirVerifikasi) && d.formulirVerifikasi.length > 0 && d.modeFormulir !== 'gabungan') {
+            hasSavedForms = true;
+          }
           setDraftInfo({ savedAt: rec.savedAt });
         }
       } catch (e) {
         console.warn('Gagal memuat draft tersimpan:', e);
       }
-      generateDefaultForms(loadedPermenperin);
+      if (!hasSavedForms) generateDefaultForms(loadedPermenperin);
     })();
 
-    // Simpan berkala setiap 20 detik (jaring pengaman selain saat pindah tab/klik keluar field)
     const intervalId = setInterval(saveDraft, 20000);
-    // Simpan sebisa mungkin saat tab/browser ditutup
     const beforeUnloadHandler = () => { saveDraft(); };
     window.addEventListener('beforeunload', beforeUnloadHandler);
     return () => {
@@ -648,17 +1013,17 @@ useEffect(() => {
   const handlePermenperinChange = (e) => {
     const val = e.target.value;
     setPermenperin(val);
-    generateDefaultForms(val); 
+    generateDefaultForms(val);
     setAcuanPeraturan(prev => prev.map(item => item.id === 2 ? { ...item, aturan: val } : item));
-  }
+  };
 
   const handlePejabatChange = (e) => {
     const jabatan = e.target.value;
     setPejabatMengetahui(jabatan);
     if (jabatan === 'Kepala BBSPJPPI') {
-      setNamaPejabat('Sofyari Rahman'); setNipPejabat('198403252009111001');   
+      setNamaPejabat('Sofyari Rahman'); setNipPejabat('198403252009111001');
     } else if (jabatan === 'Plh. Kepala BBSPJPPI') {
-      setNamaPejabat('Tri Ligayanti'); setNipPejabat('197908052003122002');      
+      setNamaPejabat('Tri Ligayanti'); setNipPejabat('197908052003122002');
     } else {
       setNamaPejabat(''); setNipPejabat('');
     }
@@ -666,24 +1031,55 @@ useEffect(() => {
 
   const addDynamic = (state, setState) => setState([...state, { id: Date.now(), file: null, keterangan: '' }]);
   const removeDynamic = (state, setState, id) => setState(state.filter(item => item.id !== id));
-  const updateDynamic = (state, setState, id, field, value) => setState(state.map(item => item.id === id ? { ...item, [field]: value } : item));
+  const updateDynamic = (state, setState, id, field, value) =>
+    setState(state.map(item =>
+      item.id === id
+        ? (field === 'file' ? { ...item, file: value, customBlobs: null, cropRects: null } : { ...item, [field]: value })
+        : item
+    ));
+
+  const updateSingleFile = (key, setter, file) => {
+    setter(file);
+    setCustomBlobsSingle((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
 
   const addRekap = () => setRekapBahanBaku([...rekapBahanBaku, { id: Date.now(), nama_bahan: '', produsen: '', asal: 'DN' }]);
   const removeRekap = (id) => setRekapBahanBaku(rekapBahanBaku.filter(item => item.id !== id));
   const updateRekap = (id, field, val) => setRekapBahanBaku(rekapBahanBaku.map(item => item.id === id ? { ...item, [field]: val } : item));
 
   // ==========================================
-  // SALIN FILE DARI FIELD LAIN (tidak perlu upload ulang dokumen yang sama)
+  // SALIN FILE DARI FIELD LAIN
   // ==========================================
-  const salinFileTunggal = (sourceFile, setTargetList, sourceLabel) => {
+  const salinFileTunggal = (sourceFile, singleKey, setTargetList, sourceLabel) => {
     if (!sourceFile) { alert(`Belum ada file "${sourceLabel}" yang diupload sebelumnya untuk disalin.`); return; }
-    setTargetList((prev) => [{ id: Date.now(), file: sourceFile, keterangan: prev[0]?.keterangan || sourceLabel }, ...prev.filter((it) => it.file)]);
+    const savedSingle = customBlobsSingle[singleKey];
+    setTargetList((prev) => [
+      {
+        id: Date.now(),
+        file: sourceFile,
+        keterangan: prev[0]?.keterangan || sourceLabel,
+        customBlobs: savedSingle?.blobs || null,
+        cropRects: savedSingle?.rectMeta || null,
+      },
+      ...prev.filter((it) => it.file)
+    ]);
   };
+
   const salinDariDaftar = (sourceList, setTargetList, sourceLabel) => {
     const filled = (sourceList || []).filter((it) => it.file);
     if (filled.length === 0) { alert(`Belum ada file "${sourceLabel}" yang diupload sebelumnya untuk disalin.`); return; }
     setTargetList((prev) => [
-      ...filled.map((it, i) => ({ id: Date.now() + i, file: it.file, keterangan: it.keterangan || prev[0]?.keterangan || sourceLabel })),
+      ...filled.map((it, i) => ({
+        id: Date.now() + i,
+        file: it.file,
+        keterangan: it.keterangan || prev[0]?.keterangan || sourceLabel,
+        customBlobs: it.customBlobs || null,
+        cropRects: it.cropRects || null,
+      })),
       ...prev.filter((it) => it.file),
     ]);
   };
@@ -693,18 +1089,15 @@ useEffect(() => {
   const updateAcuan = (id, val) => setAcuanPeraturan(acuanPeraturan.map(item => item.id === id ? { ...item, aturan: val } : item));
 
   const handleCheckAspekBmp = (id) => {
-    setAspekBmp(prev => prev.map(item => item.id === id ? { ...item, checked: !item.checked } : item))
-  }
+    setAspekBmp(prev => prev.map(item => item.id === id ? { ...item, checked: !item.checked } : item));
+  };
   const addAspekBmpBaru = () => {
     const teksInput = prompt("Masukkan Aspek BMP Tambahan:");
     if (teksInput) {
       setAspekBmp([...aspekBmp, { id: Date.now(), teks: teksInput, checked: true }]);
     }
-  }
+  };
 
-  // ==========================================
-  // PROSES SUBMIT & UPLOAD MASSAL
-  // ==========================================
   // ==========================================
   // GENERATE COVER OTOMATIS
   // ==========================================
@@ -762,7 +1155,6 @@ useEffect(() => {
         if (percent != null) setProgressPercent(percent);
       });
 
-      // Simpan proyek ini ke IndexedDB (draft tersimpan, bisa dibuka lagi nanti)
       try {
         await LHVLogic.dbSaveProject({
           jenisLhv, namaPerusahaan, idBerkas,
@@ -779,20 +1171,20 @@ useEffect(() => {
       await saveDraft();
     } catch (err) {
       console.error(err);
-      setStatus('Error: ' + (err && err.message ? err.message : String(err)) + (err && err.stack ? ('\n\n' + err.stack.split('\n').slice(0,3).join('\n')) : ''));
+      setStatus('Error: ' + (err && err.message ? err.message : String(err)) + (err && err.stack ? ('\n\n' + err.stack.split('\n').slice(0, 3).join('\n')) : ''));
       setProgressPercent(null);
     }
-  }
+  };
 
   // Layout Styles
-  const inputStyle = { width: '100%', padding: '9px', marginTop: '6px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box' }
-  const readOnlyStyle = { ...inputStyle, backgroundColor: '#e9ecef', color: '#555', cursor: 'not-allowed' }
-  const sectionStyle = { border: '1px solid #e0e0e0', padding: '20px', borderRadius: '6px', marginBottom: '20px', backgroundColor: '#fafafa' }
-  const sectionTitle = { color: '#0d47a1', marginTop: 0, marginBottom: '15px', fontSize: '15px', borderBottom: '1px solid #ddd', paddingBottom: '8px' }
-  const grid2Col = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px' }
-  const tabStyle = (n) => ({ padding: '10px 15px', cursor: 'pointer', borderBottom: activeTab === n ? '3px solid #1976d2' : '3px solid transparent', color: activeTab === n ? '#1976d2' : '#555', fontWeight: activeTab === n ? 'bold' : 'normal', backgroundColor: activeTab === n ? '#f0f7ff' : 'transparent', transition: '0.3s', whiteSpace: 'nowrap' })
+  const inputStyle = { width: '100%', padding: '9px', marginTop: '6px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box' };
+  const readOnlyStyle = { ...inputStyle, backgroundColor: '#e9ecef', color: '#555', cursor: 'not-allowed' };
+  const sectionStyle = { border: '1px solid #e0e0e0', padding: '20px', borderRadius: '6px', marginBottom: '20px', backgroundColor: '#fafafa' };
+  const sectionTitle = { color: '#0d47a1', marginTop: 0, marginBottom: '15px', fontSize: '15px', borderBottom: '1px solid #ddd', paddingBottom: '8px' };
+  const grid2Col = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px' };
+  const tabStyle = (n) => ({ padding: '10px 15px', cursor: 'pointer', borderBottom: activeTab === n ? '3px solid #1976d2' : '3px solid transparent', color: activeTab === n ? '#1976d2' : '#555', fontWeight: activeTab === n ? 'bold' : 'normal', backgroundColor: activeTab === n ? '#f0f7ff' : 'transparent', transition: '0.3s', whiteSpace: 'nowrap' });
 
-  // Render Blok Dinamis dengan penyematan ImagePreview (Kunci 7cm)
+  // Render Blok Dinamis dengan penyematan ImagePreview + Tombol Crop PDF
   const renderDynamicBlock = (title, state, setState) => (
     <div style={{ ...sectionStyle, backgroundColor: '#fff' }}>
       <h4 style={{ margin: '0 0 10px 0', color: '#1976d2' }}>{title}</h4>
@@ -804,11 +1196,24 @@ useEffect(() => {
             <GDriveButton compact mimeTypes={MIME_DOKUMEN} onFile={(f) => updateDynamic(state, setState, item.id, 'file', f)} />
             <button type="button" onClick={() => removeDynamic(state, setState, item.id)} style={{ padding: '8px', marginTop: '6px', backgroundColor: '#ffebee', color: '#c62828', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>X</button>
           </div>
-          {/* Pratinjau Dokumen Umum dikunci pada 7 cm, otomatis diskalakan proporsional ke kotak seragam */}
-          <ImagePreview file={item.file} targetWidth="7 cm" uniform={true} />
+          <ImagePreview
+            file={item.file}
+            targetWidth="7 cm"
+            uniform={true}
+            customBlobs={item.customBlobs}
+            onOpenCrop={() => setCropModal({
+              file: item.file,
+              isFormulir: false,
+              initialRects: item.cropRects,
+              onApply: (blobs, rectMeta) => {
+                setState((prev) => prev.map((it) => it.id === item.id ? { ...it, customBlobs: blobs, cropRects: rectMeta } : it));
+                setCropModal(null);
+              }
+            })}
+          />
         </div>
       ))}
-      <button type="button" onClick={() => addDynamic(state, setState)} style={{ padding: '8px 15px', backgroundColor: '#e3f2fd', color: '#1565c0', border: '1px dashed #1e88e5', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight:'bold' }}>+ Tambah Dokumen</button>
+      <button type="button" onClick={() => addDynamic(state, setState)} style={{ padding: '8px 15px', backgroundColor: '#e3f2fd', color: '#1565c0', border: '1px dashed #1e88e5', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight: 'bold' }}>+ Tambah Dokumen</button>
     </div>
   );
 
@@ -840,7 +1245,6 @@ useEffect(() => {
         }}>{status}</p>
       )}
 
-      {/* PROGRESS BAR GENERATE LHV -- tampil selama proses berlangsung (0-100%) */}
       {progressPercent != null && !status.startsWith('Error') && (
         <div style={{ marginBottom: '15px' }}>
           <div style={{
@@ -876,31 +1280,31 @@ useEffect(() => {
 
       {draftInfo && (
         <p style={{ textAlign: 'center', fontSize: '12px', color: '#888', margin: '0 0 10px 0' }}>
-          💾 Draft tersimpan otomatis (termasuk foto) — terakhir: {new Date(draftInfo.savedAt).toLocaleTimeString('id-ID')}
+          💾 Draft tersimpan otomatis (termasuk foto & hasil crop) — terakhir: {new Date(draftInfo.savedAt).toLocaleTimeString('id-ID')}
         </p>
       )}
 
       {/* NAVIGASI MENU UTAMA */}
       <div style={{ display: 'flex', borderBottom: '1px solid #ddd', marginBottom: '25px', overflowX: 'auto' }}>
-        <div onClick={() => {saveDraft(); setActiveTab(1);}} style={tabStyle(1)}>1. Cover & Logo</div>
-        <div onClick={() => {saveDraft(); setActiveTab(2);}} style={tabStyle(2)}>2. Ringkasan Eksekutif</div>
-        <div onClick={() => {saveDraft(); setActiveTab(3);}} style={tabStyle(3)}>3. Hasil Verifikasi</div>
-        <div onClick={() => {saveDraft(); setActiveTab(4);}} style={tabStyle(4)}>4. Dokumen Pendukung</div>
-        <div onClick={() => {saveDraft(); setActiveTab(5);}} style={tabStyle(5)}>5. Lampiran</div>
+        <div onClick={() => { saveDraft(); setActiveTab(1); }} style={tabStyle(1)}>1. Cover & Logo</div>
+        <div onClick={() => { saveDraft(); setActiveTab(2); }} style={tabStyle(2)}>2. Ringkasan Eksekutif</div>
+        <div onClick={() => { saveDraft(); setActiveTab(3); }} style={tabStyle(3)}>3. Hasil Verifikasi</div>
+        <div onClick={() => { saveDraft(); setActiveTab(4); }} style={tabStyle(4)}>4. Dokumen Pendukung</div>
+        <div onClick={() => { saveDraft(); setActiveTab(5); }} style={tabStyle(5)}>5. Lampiran</div>
       </div>
-      
+
       <form onSubmit={handleSubmit} onBlur={saveDraft} style={{ backgroundColor: '#fff', padding: '25px', borderRadius: '8px', boxShadow: '0 2px 10px rgba(0,0,0,0.05)' }}>
-        
+
         {/* ========================================== */}
         {/* MENU 1: DATA AWAL, COVER & LOGO */}
         {/* ========================================== */}
         {activeTab === 1 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
             <h3 style={{ color: '#333', marginTop: 0, borderBottom: '2px solid #eee', paddingBottom: '10px' }}>1. Data Awal & Skema LHV</h3>
-            
+
             <div style={{ padding: '15px', backgroundColor: '#e8f5e9', border: '1px solid #c8e6c9', borderRadius: '6px' }}>
               <label style={{ fontWeight: 'bold', color: '#2e7d32' }}>Pilih Skema LHV yang akan dibuat:</label>
-              <select value={jenisLhv} onChange={(e) => setJenisLhv(e.target.value)} style={{...inputStyle, fontWeight: 'bold', fontSize: '15px'}}>
+              <select value={jenisLhv} onChange={(e) => setJenisLhv(e.target.value)} style={{ ...inputStyle, fontWeight: 'bold', fontSize: '15px' }}>
                 <option value="Produksi Sendiri">LHV TKDN Produksi Sendiri</option>
                 <option value="Kerjasama">LHV TKDN Kerjasama</option>
                 <option value="BMP">LHV BMP (Bobot Manfaat Perusahaan)</option>
@@ -909,11 +1313,11 @@ useEffect(() => {
               </select>
             </div>
 
-            <div><label style={{ fontWeight: 'bold' }}>{jenisLhv === 'Kerjasama' ? 'Nama Pelaku Usaha (Pemohon):' : 'Nama Perusahaan (Klien):'}</label><input type="text" value={namaPerusahaan} onChange={(e) => setNamaPerusahaan(e.target.value)} required style={inputStyle}/></div>
-            <div><label style={{ fontWeight: 'bold' }}>Tanggal LHV (Tanggal Terbit Laporan):</label><input type="date" value={tanggalLhv} onChange={(e) => setTanggalLhv(e.target.value)} required style={inputStyle}/></div>
-            
+            <div><label style={{ fontWeight: 'bold' }}>{jenisLhv === 'Kerjasama' ? 'Nama Pelaku Usaha (Pemohon):' : 'Nama Perusahaan (Klien):'}</label><input type="text" value={namaPerusahaan} onChange={(e) => setNamaPerusahaan(e.target.value)} required style={inputStyle} /></div>
+            <div><label style={{ fontWeight: 'bold' }}>Tanggal LHV (Tanggal Terbit Laporan):</label><input type="date" value={tanggalLhv} onChange={(e) => setTanggalLhv(e.target.value)} required style={inputStyle} /></div>
+
             <div style={{ padding: '20px', backgroundColor: '#e3f2fd', borderRadius: '6px' }}>
-              <label style={{ fontWeight: 'bold' }}>Cover Laporan:</label><br/>
+              <label style={{ fontWeight: 'bold' }}>Cover Laporan:</label><br />
               <div style={{ display: 'flex', gap: '15px', margin: '10px 0' }}>
                 <label style={{ fontWeight: 'normal', cursor: 'pointer' }}>
                   <input type="radio" checked={coverMode === 'auto'} onChange={() => setCoverMode('auto')} /> ✨ Buat Otomatis
@@ -926,7 +1330,7 @@ useEffect(() => {
               {coverMode === 'upload' ? (
                 <>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
-                    <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileCover(e.target.files[0])} style={{ flex: 1 }}/>
+                    <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileCover(e.target.files[0])} style={{ flex: 1 }} />
                     <GDriveButton mimeTypes={MIME_GAMBAR} onFile={setFileCover} />
                   </div>
                   <ImagePreview file={fileCover} targetWidth="Bebas (Original)" />
@@ -938,24 +1342,24 @@ useEffect(() => {
                   </p>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                     <div>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Varian Desain Cover:</label><br/>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Varian Desain Cover:</label><br />
                       <select value={templateVarian} onChange={(e) => setTemplateVarian(e.target.value)} style={inputStyle}>
-                      {(CoverGenerator.TEMPLATES[jenisLhv === 'BMP' ? 'bmp' : jenisLhv === 'Jasa' ? 'jasa' : 'tkdn'] || []).map(id => (
-                      <option key={id} value={id}>{id}</option>
-                      ))}
+                        {(CoverGenerator.TEMPLATES[jenisLhv === 'BMP' ? 'bmp' : jenisLhv === 'Jasa' ? 'jasa' : 'tkdn'] || []).map(id => (
+                          <option key={id} value={id}>{id}</option>
+                        ))}
                       </select>
                     </div>
                     <div>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Foto Produk untuk Cover:</label><br/>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Foto Produk untuk Cover:</label><br />
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
-                        <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileFotoCover(e.target.files[0])} style={{ flex: 1 }}/>
+                        <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileFotoCover(e.target.files[0])} style={{ flex: 1 }} />
                         <GDriveButton mimeTypes={MIME_GAMBAR} onFile={setFileFotoCover} />
                       </div>
                     </div>
                   </div>
                   <div style={{ marginTop: '12px' }}>
                     <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Deskripsi KBLI (untuk cover, opsional):</label>
-                    <input type="text" value={kbliDeskripsi} onChange={(e) => setKbliDeskripsi(e.target.value)} placeholder="Contoh: Industri Alat Kesehatan Dalam Subgolongan 2101" style={inputStyle}/>
+                    <input type="text" value={kbliDeskripsi} onChange={(e) => setKbliDeskripsi(e.target.value)} placeholder="Contoh: Industri Alat Kesehatan Dalam Subgolongan 2101" style={inputStyle} />
                     <span style={{ fontSize: '11px', color: '#888', display: 'block', marginTop: '4px' }}>Isi nama/deskripsinya saja, TANPA mengulang kode KBLI (kode sudah otomatis ditampilkan dari field "KBLI" di atas)</span>
                   </div>
                   <div style={{ marginTop: '12px' }}>
@@ -970,18 +1374,18 @@ useEffect(() => {
 
                   {coverPreviewUrl && (
                     <div style={{ marginTop: '15px', textAlign: 'center' }}>
-                      <img src={coverPreviewUrl} alt="Pratinjau Cover" style={{ maxWidth: '320px', width: '100%', border: '1px solid #ccc', borderRadius: '4px', boxShadow: '0 2px 8px rgba(0,0,0,0.15)' }}/>
+                      <img src={coverPreviewUrl} alt="Pratinjau Cover" style={{ maxWidth: '320px', width: '100%', border: '1px solid #ccc', borderRadius: '4px', boxShadow: '0 2px 8px rgba(0,0,0,0.15)' }} />
                     </div>
                   )}
                 </div>
               )}
             </div>
             <div style={{ padding: '20px', backgroundColor: '#fff3e0', borderRadius: '6px' }}>
-              <label style={{ fontWeight: 'bold' }}>Unggah Logo Perusahaan (Klien):</label><br/>
+              <label style={{ fontWeight: 'bold' }}>Unggah Logo Perusahaan (Klien):</label><br />
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
-              <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileLogo(e.target.files[0])} style={{ flex: 1 }}/>
-              <GDriveButton mimeTypes={MIME_GAMBAR} onFile={setFileLogo} />
-            </div>
+                <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileLogo(e.target.files[0])} style={{ flex: 1 }} />
+                <GDriveButton mimeTypes={MIME_GAMBAR} onFile={setFileLogo} />
+              </div>
               <ImagePreview file={fileLogo} targetWidth="2 cm" />
             </div>
           </div>
@@ -993,7 +1397,7 @@ useEffect(() => {
         {activeTab === 2 && (
           <div>
             <h3 style={{ color: '#333', marginTop: 0, marginBottom: '20px' }}>Tabel Ringkasan Eksekutif & Bab Pendahuluan</h3>
-            
+
             {jenisLhv !== 'BMP' && (
               <div style={{ ...sectionStyle, borderColor: '#1976d2', backgroundColor: '#f0f7ff' }}>
                 <h4 style={{ ...sectionTitle, color: '#1976d2', borderBottom: '1px solid #bbdefb' }}>Acuan Peraturan (Bab Pendahuluan LHV)</h4>
@@ -1004,34 +1408,34 @@ useEffect(() => {
                       return true;
                     })
                     .map((item, index) => (
-                    <div key={item.id} style={{ display: 'flex', gap: '10px' }}>
-                      <div style={{ padding: '10px', backgroundColor: '#e3f2fd', border: '1px solid #90caf9', borderRadius: '4px', fontWeight: 'bold', color: '#1565c0' }}>{index + 1}.</div>
-                      {item.type === 'dropdown' ? (
-                        <select 
-                          value={item.aturan} 
-                          onChange={(e) => {
-                            if (item.id === 2) {
-                              handlePermenperinChange(e);
-                            } else {
-                              updateAcuan(item.id, e.target.value);
-                            }
-                          }} 
-                          style={{ ...inputStyle, marginTop: 0, flex: 1, backgroundColor: '#fff', color: '#333' }}
-                        >
-                          {item.options.map((opt, i) => <option key={i} value={opt}>{opt}</option>)}
-                        </select>
-                      ) : item.type === 'fixed' ? (
-                        <textarea rows="2" value={item.aturan} readOnly style={{ ...readOnlyStyle, marginTop: 0, flex: 1, resize: 'none' }}></textarea>
-                      ) : (
-                        <textarea rows="2" value={item.aturan} onChange={(e) => updateAcuan(item.id, e.target.value)} style={{ ...inputStyle, marginTop: 0, flex: 1 }} placeholder="Masukkan nama peraturan tambahan..."></textarea>
-                      )}
-                      {item.type === 'dynamic' ? (
-                        <button type="button" onClick={() => removeAcuan(item.id)} style={{ padding: '10px', backgroundColor: '#ffebee', color: '#c62828', border: '1px solid #ffcdd2', borderRadius: '4px', cursor: 'pointer' }}>X</button>
-                      ) : (
-                        <button type="button" disabled style={{ padding: '10px', backgroundColor: '#f5f5f5', color: '#ccc', border: '1px solid #ddd', borderRadius: '4px', cursor: 'not-allowed' }}>X</button>
-                      )}
-                    </div>
-                  ))}
+                      <div key={item.id} style={{ display: 'flex', gap: '10px' }}>
+                        <div style={{ padding: '10px', backgroundColor: '#e3f2fd', border: '1px solid #90caf9', borderRadius: '4px', fontWeight: 'bold', color: '#1565c0' }}>{index + 1}.</div>
+                        {item.type === 'dropdown' ? (
+                          <select
+                            value={item.aturan}
+                            onChange={(e) => {
+                              if (item.id === 2) {
+                                handlePermenperinChange(e);
+                              } else {
+                                updateAcuan(item.id, e.target.value);
+                              }
+                            }}
+                            style={{ ...inputStyle, marginTop: 0, flex: 1, backgroundColor: '#fff', color: '#333' }}
+                          >
+                            {item.options.map((opt, i) => <option key={i} value={opt}>{opt}</option>)}
+                          </select>
+                        ) : item.type === 'fixed' ? (
+                          <textarea rows="2" value={item.aturan} readOnly style={{ ...readOnlyStyle, marginTop: 0, flex: 1, resize: 'none' }}></textarea>
+                        ) : (
+                          <textarea rows="2" value={item.aturan} onChange={(e) => updateAcuan(item.id, e.target.value)} style={{ ...inputStyle, marginTop: 0, flex: 1 }} placeholder="Masukkan nama peraturan tambahan..."></textarea>
+                        )}
+                        {item.type === 'dynamic' ? (
+                          <button type="button" onClick={() => removeAcuan(item.id)} style={{ padding: '10px', backgroundColor: '#ffebee', color: '#c62828', border: '1px solid #ffcdd2', borderRadius: '4px', cursor: 'pointer' }}>X</button>
+                        ) : (
+                          <button type="button" disabled style={{ padding: '10px', backgroundColor: '#f5f5f5', color: '#ccc', border: '1px solid #ddd', borderRadius: '4px', cursor: 'not-allowed' }}>X</button>
+                        )}
+                      </div>
+                    ))}
                 </div>
                 <button type="button" onClick={addAcuan} style={{ marginTop: '15px', padding: '10px 15px', backgroundColor: '#fff', color: '#1976d2', border: '1px dashed #1976d2', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight: 'bold' }}>+ Tambah Acuan Peraturan Baru</button>
               </div>
@@ -1073,17 +1477,17 @@ useEffect(() => {
               <h4 style={sectionTitle}>B. Identitas Perusahaan</h4>
               <div style={grid2Col}>
                 <div><label style={{ fontWeight: 'bold', fontSize: '13px' }}>{jenisLhv === 'Kerjasama' ? 'Nama Pelaku Usaha:' : 'Nama Perusahaan:'}</label><input type="text" value={namaPerusahaan} readOnly style={readOnlyStyle} /></div>
-                
+
                 {jenisLhv === 'Kerjasama' && (
                   <>
-                    <div><label style={{ fontWeight: 'bold', fontSize: '13px', color:'#d84315' }}>Nama Perusahaan Industri:</label><input type="text" value={namaPerusahaanIndustri} onChange={(e) => setNamaPerusahaanIndustri(e.target.value)} style={inputStyle} /></div>
-                    <div style={{ gridColumn: '1 / -1' }}><label style={{ fontWeight: 'bold', fontSize: '13px', color:'#d84315' }}>Alamat Perusahaan Industri (Kantor):</label><textarea rows="2" value={alamatPerusahaanIndustri} onChange={(e) => setAlamatPerusahaanIndustri(e.target.value)} style={inputStyle}></textarea></div>
+                    <div><label style={{ fontWeight: 'bold', fontSize: '13px', color: '#d84315' }}>Nama Perusahaan Industri:</label><input type="text" value={namaPerusahaanIndustri} onChange={(e) => setNamaPerusahaanIndustri(e.target.value)} style={inputStyle} /></div>
+                    <div style={{ gridColumn: '1 / -1' }}><label style={{ fontWeight: 'bold', fontSize: '13px', color: '#d84315' }}>Alamat Perusahaan Industri (Kantor):</label><textarea rows="2" value={alamatPerusahaanIndustri} onChange={(e) => setAlamatPerusahaanIndustri(e.target.value)} style={inputStyle}></textarea></div>
                   </>
                 )}
 
                 <div style={{ gridColumn: '1 / -1' }}><label style={{ fontWeight: 'bold', fontSize: '13px' }}>{jenisLhv === 'Kerjasama' ? 'Alamat Kantor Pelaku Usaha:' : 'Alamat Kantor Perusahaan:'}</label><textarea rows="2" value={alamatKantor} onChange={(e) => setAlamatKantor(e.target.value)} style={inputStyle}></textarea></div>
                 <div style={{ gridColumn: '1 / -1' }}><label style={{ fontWeight: 'bold', fontSize: '13px' }}>{jenisLhv === 'Kerjasama' ? 'Alamat Pabrik Perusahaan Industri:' : 'Alamat Lokasi Pabrik:'}</label><textarea rows="2" value={alamatPabrik} onChange={(e) => setAlamatPabrik(e.target.value)} style={inputStyle}></textarea></div>
-                
+
                 <div>
                   <label style={{ fontWeight: 'bold', fontSize: '13px' }}>{jenisLhv === 'Kerjasama' ? 'Skala Pelaku Usaha:' : 'Skala Perusahaan:'}</label>
                   <select value={skalaPerusahaan} onChange={(e) => setSkalaPerusahaan(e.target.value)} style={inputStyle}>
@@ -1097,7 +1501,7 @@ useEffect(() => {
 
                 {jenisLhv === 'Kerjasama' && (
                   <div>
-                    <label style={{ fontWeight: 'bold', fontSize: '13px', color:'#d84315' }}>Skala Perusahaan Industri:</label>
+                    <label style={{ fontWeight: 'bold', fontSize: '13px', color: '#d84315' }}>Skala Perusahaan Industri:</label>
                     <select value={skalaPerusahaanIndustri} onChange={(e) => setSkalaPerusahaanIndustri(e.target.value)} style={inputStyle}>
                       <option value="Perorangan">Perorangan</option>
                       <option value="Mikro">Mikro</option>
@@ -1109,9 +1513,9 @@ useEffect(() => {
                 )}
 
                 <div><label style={{ fontWeight: 'bold', fontSize: '13px' }}>{jenisLhv === 'Kerjasama' ? 'Nomor Izin Pelaku Usaha:' : 'Nomor Perizinan Berusaha (NIB):'}</label><input type="text" value={noIzin} onChange={(e) => setNoIzin(e.target.value)} style={inputStyle} /></div>
-                
+
                 {jenisLhv === 'Kerjasama' && (
-                   <div><label style={{ fontWeight: 'bold', fontSize: '13px', color:'#d84315' }}>Nomor Izin Perusahaan Industri:</label><input type="text" value={noIzinPerusahaanIndustri} onChange={(e) => setNoIzinPerusahaanIndustri(e.target.value)} style={inputStyle} /></div>
+                  <div><label style={{ fontWeight: 'bold', fontSize: '13px', color: '#d84315' }}>Nomor Izin Perusahaan Industri:</label><input type="text" value={noIzinPerusahaanIndustri} onChange={(e) => setNoIzinPerusahaanIndustri(e.target.value)} style={inputStyle} /></div>
                 )}
               </div>
             </div>
@@ -1138,11 +1542,11 @@ useEffect(() => {
                   <div style={{ gridColumn: '1 / -1', padding: '15px', backgroundColor: '#f3f8ff', borderRadius: '6px' }}>
                     <label style={{ fontWeight: 'bold', fontSize: '13px' }}>
                       {jenisLhv === 'Kerjasama' ? 'Unggah Foto Produk (tampil di Ringkasan Eksekutif, tag {{ foto_produk }}):' : 'Unggah Foto Barang (tampil di Ringkasan Eksekutif, tag {{ foto_barang }}):'}
-                    </label><br/>
+                    </label><br />
                     {jenisLhv === 'Kerjasama' ? (
                       <>
                         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
-                          <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileFotoProdukUtama(e.target.files[0])} style={{ flex: 1 }}/>
+                          <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileFotoProdukUtama(e.target.files[0])} style={{ flex: 1 }} />
                           <GDriveButton mimeTypes={MIME_GAMBAR} onFile={setFileFotoProdukUtama} />
                         </div>
                         <ImagePreview file={fileFotoProdukUtama} targetWidth="7 cm" />
@@ -1151,7 +1555,7 @@ useEffect(() => {
                     ) : (
                       <>
                         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
-                          <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileFotoBarang(e.target.files[0])} style={{ flex: 1 }}/>
+                          <input type="file" accept="image/png, image/jpeg" onChange={(e) => setFileFotoBarang(e.target.files[0])} style={{ flex: 1 }} />
                           <GDriveButton mimeTypes={MIME_GAMBAR} onFile={setFileFotoBarang} />
                         </div>
                         <ImagePreview file={fileFotoBarang} targetWidth="7 cm" />
@@ -1213,7 +1617,7 @@ useEffect(() => {
         {/* ========================================== */}
         {/* MENU 3: HASIL VERIFIKASI */}
         {/* ========================================== */}
-        {activeTab === 3 && ( 
+        {activeTab === 3 && (
           <div>
             <h3 style={{ color: '#333', marginTop: 0, marginBottom: '5px' }}>Rincian Hasil Verifikasi</h3>
 
@@ -1229,18 +1633,31 @@ useEffect(() => {
             {modeFormulir === 'gabungan' ? (
               <div style={{ padding: '15px', border: '1px solid #e0e0e0', borderRadius: '6px', backgroundColor: '#fafafa' }}>
                 <p style={{ color: '#666', fontSize: '13px', marginTop: 0 }}>
-                  Upload 1 file PDF yang berisi SEMUA formulir sekaligus (mis. hasil export dari Excel/aplikasi penghitungan TKDN) — sistem akan otomatis memecahnya jadi beberapa formulir, <strong>1 halaman PDF = 1 formulir</strong>, sesuai urutan halaman.
+                  Upload 1 file PDF yang berisi SEMUA formulir sekaligus — sistem akan otomatis memangkas margin kosong/footer, atau klik <strong>✂️ Pratinjau &amp; Crop</strong> untuk mengatur area potongan tiap halaman secara manual.
                 </p>
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <input type="file" accept="application/pdf,image/png,image/jpeg" onChange={(e) => setFileFormulirGabungan(e.target.files[0])} style={{ flex: 1 }} />
-                  <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileFormulirGabungan} />
+                  <input type="file" accept="application/pdf,image/png,image/jpeg" onChange={(e) => updateSingleFile('formulirGabungan', setFileFormulirGabungan, e.target.files[0])} style={{ flex: 1 }} />
+                  <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('formulirGabungan', setFileFormulirGabungan, f)} />
                 </div>
-                <ImagePreview file={fileFormulirGabungan} targetWidth="Bebas (per halaman)" />
+                <ImagePreview
+                  file={fileFormulirGabungan}
+                  targetWidth="16,5 cm (penuh lebar)"
+                  customBlobs={customBlobsSingle.formulirGabungan?.blobs}
+                  onOpenCrop={() => setCropModal({
+                    file: fileFormulirGabungan,
+                    isFormulir: true,
+                    initialRects: customBlobsSingle.formulirGabungan?.rectMeta,
+                    onApply: (blobs, rectMeta) => {
+                      setCustomBlobsSingle((prev) => ({ ...prev, formulirGabungan: { blobs, rectMeta } }));
+                      setCropModal(null);
+                    }
+                  })}
+                />
               </div>
             ) : (
               <>
                 <p style={{ color: '#666', fontSize: '14px', marginBottom: '20px' }}>
-                  Sistem otomatis menyediakan <strong>{formulirVerifikasi.length} baris</strong> sesuai dasar hukum yang Anda pilih di Menu 2.
+                  Sistem otomatis menyediakan <strong>{formulirVerifikasi.length} baris</strong> sesuai dasar hukum yang Anda pilih di Menu 2. Klik <strong>✂️ Pratinjau &amp; Crop</strong> jika mengunggah PDF agar area tabel terpotong presisi.
                 </p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
                   {formulirVerifikasi.map((form) => (
@@ -1251,23 +1668,44 @@ useEffect(() => {
                           <input type="text" value={form.judul} onChange={(e) => setFormulirVerifikasi(formulirVerifikasi.map(f => f.id === form.id ? { ...f, judul: e.target.value } : f))} style={inputStyle} />
                         </div>
                         <div style={{ flex: '2' }}>
-                          <label style={{ fontWeight: 'bold', fontSize: '12px' }}>Unggah Screenshot Hasil Excel (PNG/JPG):</label>
+                          <label style={{ fontWeight: 'bold', fontSize: '12px' }}>Unggah Hasil Formulir (PNG/JPG/PDF/Excel):</label>
                           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '8px' }}>
-                            <input type="file" accept="image/png, image/jpeg, application/pdf, .xlsx, .xls" onChange={(e) => setFormulirVerifikasi(formulirVerifikasi.map(f => f.id === form.id ? { ...f, file: e.target.files[0] } : f))} style={{ flex: 1 }} />
-                            <GDriveButton mimeTypes={MIME_FORMULIR} onFile={(fl) => setFormulirVerifikasi(formulirVerifikasi.map(f => f.id === form.id ? { ...f, file: fl } : f))} />
+                            <input
+                              type="file"
+                              accept="image/png, image/jpeg, application/pdf, .xlsx, .xls"
+                              onChange={(e) => setFormulirVerifikasi(formulirVerifikasi.map(f => f.id === form.id ? { ...f, file: e.target.files[0], customBlobs: null, cropRects: null } : f))}
+                              style={{ flex: 1 }}
+                            />
+                            <GDriveButton
+                              mimeTypes={MIME_FORMULIR}
+                              onFile={(fl) => setFormulirVerifikasi(formulirVerifikasi.map(f => f.id === form.id ? { ...f, file: fl, customBlobs: null, cropRects: null } : f))}
+                            />
                           </div>
-                          <span style={{ fontSize: '11px', color: '#888', display: 'block', marginTop: '4px' }}>Bisa gambar (PNG/JPG), PDF (per halaman otomatis jadi gambar), atau Excel (.xlsx/.xls, otomatis digambar sebagai tabel)</span>
+                          <span style={{ fontSize: '11px', color: '#888', display: 'block', marginTop: '4px' }}>Bisa gambar (PNG/JPG), PDF (bisa di-crop manual per halaman), atau Excel (.xlsx/.xls)</span>
                         </div>
-                        <button type="button" onClick={() => setFormulirVerifikasi(formulirVerifikasi.filter(f => f.id !== form.id))} style={{ padding: '8px 12px', backgroundColor: '#ffebee', color: '#c62828', border: 'none', borderRadius: '4px', cursor: 'pointer', marginTop:'20px' }}>X</button>
+                        <button type="button" onClick={() => setFormulirVerifikasi(formulirVerifikasi.filter(f => f.id !== form.id))} style={{ padding: '8px 12px', backgroundColor: '#ffebee', color: '#c62828', border: 'none', borderRadius: '4px', cursor: 'pointer', marginTop: '20px' }}>X</button>
                       </div>
-                      <ImagePreview file={form.file} targetWidth="7 cm" />
+                      <ImagePreview
+                        file={form.file}
+                        targetWidth="16,5 cm (penuh lebar)"
+                        customBlobs={form.customBlobs}
+                        onOpenCrop={() => setCropModal({
+                          file: form.file,
+                          isFormulir: true,
+                          initialRects: form.cropRects,
+                          onApply: (blobs, rectMeta) => {
+                            setFormulirVerifikasi((prev) => prev.map((f) => f.id === form.id ? { ...f, customBlobs: blobs, cropRects: rectMeta } : f));
+                            setCropModal(null);
+                          }
+                        })}
+                      />
                     </div>
                   ))}
                 </div>
-                <button type="button" onClick={() => setFormulirVerifikasi([...formulirVerifikasi, { id: Date.now(), judul: 'Formulir Tambahan', file: null }])} style={{ marginTop: '20px', padding: '10px 15px', backgroundColor: '#e3f2fd', color: '#1565c0', border: '1px dashed #1e88e5', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight:'bold' }}>+ Tambah Formulir Baru</button>
+                <button type="button" onClick={() => setFormulirVerifikasi([...formulirVerifikasi, { id: Date.now(), judul: 'Formulir Tambahan', file: null }])} style={{ marginTop: '20px', padding: '10px 15px', backgroundColor: '#e3f2fd', color: '#1565c0', border: '1px dashed #1e88e5', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight: 'bold' }}>+ Tambah Formulir Baru</button>
               </>
             )}
-          </div> 
+          </div>
         )}
 
         {/* ========================================== */}
@@ -1295,10 +1733,10 @@ useEffect(() => {
                 "4 foto kecil" tetap 2 kolom tapi ukuran foto diperkecil, sehingga lebih banyak baris (dan foto) yang muat dalam 1 halaman cetak.
               </p>
             </div>
-            
+
             {jenisLhv === 'BMP' ? (
               <>
-                <p style={{fontSize:'13px', color:'#666', marginTop:'-10px', marginBottom:'20px'}}>* Silakan unggah bukti administrasi pendukung untuk setiap aspek indikator penilaian BMP berikut (Format dapat berupa Gambar maupun PDF).</p>
+                <p style={{ fontSize: '13px', color: '#666', marginTop: '-10px', marginBottom: '20px' }}>* Silakan unggah bukti administrasi pendukung untuk setiap aspek indikator penilaian BMP berikut (Format dapat berupa Gambar maupun PDF).</p>
 
                 <div style={sectionStyle}>
                   <h4 style={sectionTitle}>1.a. Profil Perusahaan (Kantor)</h4>
@@ -1345,12 +1783,25 @@ useEffect(() => {
                 </div>
 
                 <div style={{ marginBottom: '15px', padding: '10px', backgroundColor: '#e3f2fd', borderRadius: '4px' }}>
-                  <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Struktur Organisasi Perusahaan (Gambar):</label>
+                  <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Struktur Organisasi Perusahaan (Gambar/PDF):</label>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '5px' }}>
-                    <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileStruktur(e.target.files[0])} style={{ flex: 1 }} />
-                    <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileStruktur} />
+                    <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('struktur', setFileStruktur, e.target.files[0])} style={{ flex: 1 }} />
+                    <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('struktur', setFileStruktur, f)} />
                   </div>
-                  <ImagePreview file={fileStruktur} targetWidth="7 cm" />
+                  <ImagePreview
+                    file={fileStruktur}
+                    targetWidth="7 cm"
+                    customBlobs={customBlobsSingle.struktur?.blobs}
+                    onOpenCrop={() => setCropModal({
+                      file: fileStruktur,
+                      isFormulir: false,
+                      initialRects: customBlobsSingle.struktur?.rectMeta,
+                      onApply: (blobs, rectMeta) => {
+                        setCustomBlobsSingle((prev) => ({ ...prev, struktur: { blobs, rectMeta } }));
+                        setCropModal(null);
+                      }
+                    })}
+                  />
                 </div>
                 {aspekBmp.find(a => a.id === 2)?.checked && renderDynamicBlock("1. Bukti Penyerapan Tenaga Kerja", fileTenagaKerjaBmp, setFileTenagaKerjaBmp)}
                 {aspekBmp.find(a => a.id === 3)?.checked && renderDynamicBlock("2. Bukti Penambahan Investasi Baru", fileInvestasiBmp, setFileInvestasiBmp)}
@@ -1386,13 +1837,26 @@ useEffect(() => {
                     <div style={{ gridColumn: '1 / -1' }}><label style={{ fontWeight: 'bold', fontSize: '13px' }}>Akta Perubahan/Pendirian:</label><textarea rows="2" value={aktaKantor} onChange={(e) => setAktaKantor(e.target.value)} style={inputStyle}></textarea></div>
                     <div><label style={{ fontWeight: 'bold', fontSize: '13px' }}>NPWP:</label><input type="text" value={npwpKantor} onChange={(e) => setNpwpKantor(e.target.value)} style={inputStyle} /></div>
                     <div><label style={{ fontWeight: 'bold', fontSize: '13px' }}>IUI / NIB:</label><input type="text" value={noIzin} readOnly style={readOnlyStyle} /></div>
-                    <div style={{ gridColumn: '1 / -1', padding: '10px', backgroundColor: '#e3f2fd', borderRadius: '4px', marginTop:'10px' }}>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Struktur Organisasi Pelaku Usaha (Gambar):</label>
+                    <div style={{ gridColumn: '1 / -1', padding: '10px', backgroundColor: '#e3f2fd', borderRadius: '4px', marginTop: '10px' }}>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Struktur Organisasi Pelaku Usaha (Gambar/PDF):</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '5px' }}>
-                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileStruktur(e.target.files[0])} style={{ flex: 1 }} />
-                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileStruktur} />
+                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('struktur', setFileStruktur, e.target.files[0])} style={{ flex: 1 }} />
+                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('struktur', setFileStruktur, f)} />
                       </div>
-                      <ImagePreview file={fileStruktur} targetWidth="7 cm" />
+                      <ImagePreview
+                        file={fileStruktur}
+                        targetWidth="7 cm"
+                        customBlobs={customBlobsSingle.struktur?.blobs}
+                        onOpenCrop={() => setCropModal({
+                          file: fileStruktur,
+                          isFormulir: false,
+                          initialRects: customBlobsSingle.struktur?.rectMeta,
+                          onApply: (blobs, rectMeta) => {
+                            setCustomBlobsSingle((prev) => ({ ...prev, struktur: { blobs, rectMeta } }));
+                            setCropModal(null);
+                          }
+                        })}
+                      />
                     </div>
                   </div>
                 </div>
@@ -1423,21 +1887,47 @@ useEffect(() => {
                     <div style={{ gridColumn: '1 / -1' }}><label style={{ fontWeight: 'bold', fontSize: '13px' }}>Alamat Pabrik:</label><textarea rows="2" value={alamatPabrik} readOnly style={readOnlyStyle}></textarea></div>
                   </div>
                   <div style={grid2Col}>
-                    <div style={{ padding: '10px', backgroundColor: '#ffe0b2', borderRadius: '4px', marginTop:'15px' }}>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px', color: '#e65100' }}>Struktur Organisasi Perusahaan Industri (Gambar):</label>
+                    <div style={{ padding: '10px', backgroundColor: '#ffe0b2', borderRadius: '4px', marginTop: '15px' }}>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px', color: '#e65100' }}>Struktur Organisasi Perusahaan Industri (Gambar/PDF):</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '5px' }}>
-                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileStrukturIndustri(e.target.files[0])} style={{ flex: 1 }} />
-                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileStrukturIndustri} />
+                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('strukturIndustri', setFileStrukturIndustri, e.target.files[0])} style={{ flex: 1 }} />
+                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('strukturIndustri', setFileStrukturIndustri, f)} />
                       </div>
-                      <ImagePreview file={fileStrukturIndustri} targetWidth="7 cm" />
+                      <ImagePreview
+                        file={fileStrukturIndustri}
+                        targetWidth="7 cm"
+                        customBlobs={customBlobsSingle.strukturIndustri?.blobs}
+                        onOpenCrop={() => setCropModal({
+                          file: fileStrukturIndustri,
+                          isFormulir: false,
+                          initialRects: customBlobsSingle.strukturIndustri?.rectMeta,
+                          onApply: (blobs, rectMeta) => {
+                            setCustomBlobsSingle((prev) => ({ ...prev, strukturIndustri: { blobs, rectMeta } }));
+                            setCropModal(null);
+                          }
+                        })}
+                      />
                     </div>
-                    <div style={{ padding: '10px', backgroundColor: '#fff3e0', borderRadius: '4px', marginTop:'15px' }}>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Diagram Alur Proses Produksi (Gambar):</label>
+                    <div style={{ padding: '10px', backgroundColor: '#fff3e0', borderRadius: '4px', marginTop: '15px' }}>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Diagram Alur Proses Produksi (Gambar/PDF):</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '5px' }}>
-                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileAlurProduksi(e.target.files[0])} style={{ flex: 1 }} />
-                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileAlurProduksi} />
+                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('alurProduksi', setFileAlurProduksi, e.target.files[0])} style={{ flex: 1 }} />
+                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('alurProduksi', setFileAlurProduksi, f)} />
                       </div>
-                      <ImagePreview file={fileAlurProduksi} targetWidth="7 cm" />
+                      <ImagePreview
+                        file={fileAlurProduksi}
+                        targetWidth="7 cm"
+                        customBlobs={customBlobsSingle.alurProduksi?.blobs}
+                        onOpenCrop={() => setCropModal({
+                          file: fileAlurProduksi,
+                          isFormulir: false,
+                          initialRects: customBlobsSingle.alurProduksi?.rectMeta,
+                          onApply: (blobs, rectMeta) => {
+                            setCustomBlobsSingle((prev) => ({ ...prev, alurProduksi: { blobs, rectMeta } }));
+                            setCropModal(null);
+                          }
+                        })}
+                      />
                     </div>
                   </div>
                 </div>
@@ -1495,23 +1985,49 @@ useEffect(() => {
                 </div>
 
                 <div style={sectionStyle}>
-                  <h4 style={sectionTitle}>2 & 3. Berkas Struktur Organisasi & Alur Produksi</h4>
+                  <h4 style={sectionTitle}>2 &amp; 3. Berkas Struktur Organisasi &amp; Alur Produksi</h4>
                   <div style={grid2Col}>
                     <div style={{ padding: '10px', backgroundColor: '#e3f2fd', borderRadius: '4px' }}>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>2. Struktur Organisasi Perusahaan (Gambar):</label>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>2. Struktur Organisasi Perusahaan (Gambar/PDF):</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '5px' }}>
-                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileStruktur(e.target.files[0])} style={{ flex: 1 }} />
-                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileStruktur} />
+                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('struktur', setFileStruktur, e.target.files[0])} style={{ flex: 1 }} />
+                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('struktur', setFileStruktur, f)} />
                       </div>
-                      <ImagePreview file={fileStruktur} targetWidth="7 cm" />
+                      <ImagePreview
+                        file={fileStruktur}
+                        targetWidth="7 cm"
+                        customBlobs={customBlobsSingle.struktur?.blobs}
+                        onOpenCrop={() => setCropModal({
+                          file: fileStruktur,
+                          isFormulir: false,
+                          initialRects: customBlobsSingle.struktur?.rectMeta,
+                          onApply: (blobs, rectMeta) => {
+                            setCustomBlobsSingle((prev) => ({ ...prev, struktur: { blobs, rectMeta } }));
+                            setCropModal(null);
+                          }
+                        })}
+                      />
                     </div>
                     <div style={{ padding: '10px', backgroundColor: '#fff3e0', borderRadius: '4px' }}>
-                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>3. Diagram Alur Proses Produksi (Gambar):</label>
+                      <label style={{ fontWeight: 'bold', fontSize: '13px' }}>3. Diagram Alur Proses Produksi (Gambar/PDF):</label>
                       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '5px' }}>
-                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileAlurProduksi(e.target.files[0])} style={{ flex: 1 }} />
-                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileAlurProduksi} />
+                        <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('alurProduksi', setFileAlurProduksi, e.target.files[0])} style={{ flex: 1 }} />
+                        <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('alurProduksi', setFileAlurProduksi, f)} />
                       </div>
-                      <ImagePreview file={fileAlurProduksi} targetWidth="7 cm" />
+                      <ImagePreview
+                        file={fileAlurProduksi}
+                        targetWidth="7 cm"
+                        customBlobs={customBlobsSingle.alurProduksi?.blobs}
+                        onOpenCrop={() => setCropModal({
+                          file: fileAlurProduksi,
+                          isFormulir: false,
+                          initialRects: customBlobsSingle.alurProduksi?.rectMeta,
+                          onApply: (blobs, rectMeta) => {
+                            setCustomBlobsSingle((prev) => ({ ...prev, alurProduksi: { blobs, rectMeta } }));
+                            setCropModal(null);
+                          }
+                        })}
+                      />
                     </div>
                   </div>
                 </div>
@@ -1523,7 +2039,7 @@ useEffect(() => {
                 {renderDynamicBlock("8. Kartu Identitas Kewarganegaraan (KTP)", fileKtp, setFileKtp)}
               </>
             )}
-          </div> 
+          </div>
         )}
 
         {/* ========================================== */}
@@ -1532,7 +2048,7 @@ useEffect(() => {
         {activeTab === 5 && (
           <div>
             <h3 style={{ borderBottom: '2px solid #ddd', paddingBottom: '10px' }}>Berkas Lampiran LHV Dokumen</h3>
-            
+
             <h4 style={{ backgroundColor: '#f3e5f5', padding: '10px', borderRadius: '4px', color: '#6a1b9a' }}>0. Dokumen Pengembangan</h4>
             {renderDynamicBlock("Dokumen Pengembangan", fileDokumenPengembangan, setFileDokumenPengembangan)}
 
@@ -1542,16 +2058,15 @@ useEffect(() => {
             {renderDynamicBlock("c. Sertifikat Standar", fileSertifikatStandar, setFileSertifikatStandar)}
             {renderDynamicBlock("d. Surat Izin Operasional / IZIN", fileIzinUsaha, setFileIzinUsaha)}
             {renderDynamicBlock("e. NPWP Perusahaan", fileNpwpLampiran, setFileNpwpLampiran)}
-            
-            {/* Dipakai semua skema termasuk BMP -- template BMP juga punya tag sert_merek/sert_produk/nie/bpom */}
+
             {renderDynamicBlock("f. Sertifikat Merek", fileSertifikatMerek, setFileSertifikatMerek)}
             {renderDynamicBlock("g. Sertifikat Produk", fileSertifikatProduk, setFileSertifikatProduk)}
             {renderDynamicBlock("h. NIE", fileNie, setFileNie)}
             {renderDynamicBlock("i. BPOM", fileBpom, setFileBpom)}
 
-            <h4 style={{ backgroundColor: '#e3f2fd', padding: '10px', borderRadius: '4px', color: '#0d47a1', marginTop: '30px' }}>2. Foto Produk & Lampiran Teknis</h4>
+            <h4 style={{ backgroundColor: '#e3f2fd', padding: '10px', borderRadius: '4px', color: '#0d47a1', marginTop: '30px' }}>2. Foto Produk &amp; Lampiran Teknis</h4>
             {renderDynamicBlock("a. Foto Produk Akhir", fileFotoProduk, setFileFotoProduk)}
-            
+
             {jenisLhv !== 'BMP' && (
               <div style={{ marginBottom: '15px', padding: '15px', border: '1px solid #ddd', borderRadius: '6px', backgroundColor: '#fff' }}>
                 <h4 style={{ margin: '0 0 10px 0', color: '#1976d2' }}>b. Rekapitulasi Bahan Baku</h4>
@@ -1570,39 +2085,52 @@ useEffect(() => {
                     <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: '10px' }}>
                       <thead>
                         <tr style={{ backgroundColor: '#f5f5f5', textAlign: 'left' }}>
-                          <th style={{ padding: '8px', border: '1px solid #ccc', width:'40px', textAlign:'center' }}>No</th>
+                          <th style={{ padding: '8px', border: '1px solid #ccc', width: '40px', textAlign: 'center' }}>No</th>
                           <th style={{ padding: '8px', border: '1px solid #ccc' }}>Bahan Baku</th>
                           <th style={{ padding: '8px', border: '1px solid #ccc' }}>Produsen/Pemasok</th>
-                          <th style={{ padding: '8px', border: '1px solid #ccc', width:'90px' }}>Asal</th>
-                          <th style={{ padding: '8px', border: '1px solid #ccc', width:'60px', textAlign:'center' }}>Aksi</th>
+                          <th style={{ padding: '8px', border: '1px solid #ccc', width: '90px' }}>Asal</th>
+                          <th style={{ padding: '8px', border: '1px solid #ccc', width: '60px', textAlign: 'center' }}>Aksi</th>
                         </tr>
                       </thead>
                       <tbody>
                         {rekapBahanBaku.map((item, index) => (
                           <tr key={item.id}>
                             <td style={{ padding: '8px', border: '1px solid #ccc', textAlign: 'center' }}>{index + 1}</td>
-                            <td style={{ padding: '8px', border: '1px solid #ccc' }}><input type="text" value={item.nama_bahan} onChange={(e) => updateRekap(item.id, 'nama_bahan', e.target.value)} style={{ width: '100%', padding: '5px', boxSizing:'border-box' }} /></td>
-                            <td style={{ padding: '8px', border: '1px solid #ccc' }}><input type="text" value={item.produsen} onChange={(e) => updateRekap(item.id, 'produsen', e.target.value)} style={{ width: '100%', padding: '5px', boxSizing:'border-box' }} /></td>
+                            <td style={{ padding: '8px', border: '1px solid #ccc' }}><input type="text" value={item.nama_bahan} onChange={(e) => updateRekap(item.id, 'nama_bahan', e.target.value)} style={{ width: '100%', padding: '5px', boxSizing: 'border-box' }} /></td>
+                            <td style={{ padding: '8px', border: '1px solid #ccc' }}><input type="text" value={item.produsen} onChange={(e) => updateRekap(item.id, 'produsen', e.target.value)} style={{ width: '100%', padding: '5px', boxSizing: 'border-box' }} /></td>
                             <td style={{ padding: '8px', border: '1px solid #ccc' }}>
-                              <select value={item.asal} onChange={(e) => updateRekap(item.id, 'asal', e.target.value)} style={{ padding: '5px', width:'100%' }}>
+                              <select value={item.asal} onChange={(e) => updateRekap(item.id, 'asal', e.target.value)} style={{ padding: '5px', width: '100%' }}>
                                 <option value="DN">DN</option><option value="LN">LN</option>
                               </select>
                             </td>
-                            <td style={{ padding: '8px', border: '1px solid #ccc', textAlign: 'center' }}><button type="button" onClick={() => removeRekap(item.id)} style={{ color: '#c62828', backgroundColor:'transparent', border:'none', cursor: 'pointer', fontWeight:'bold' }}>X</button></td>
+                            <td style={{ padding: '8px', border: '1px solid #ccc', textAlign: 'center' }}><button type="button" onClick={() => removeRekap(item.id)} style={{ color: '#c62828', backgroundColor: 'transparent', border: 'none', cursor: 'pointer', fontWeight: 'bold' }}>X</button></td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
-                    <button type="button" onClick={addRekap} style={{ padding: '8px 15px', backgroundColor: '#e3f2fd', color: '#1565c0', border: '1px dashed #1e88e5', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight:'bold' }}>+ Tambah Baris Bahan Baku</button>
+                    <button type="button" onClick={addRekap} style={{ padding: '8px 15px', backgroundColor: '#e3f2fd', color: '#1565c0', border: '1px dashed #1e88e5', borderRadius: '4px', cursor: 'pointer', width: '100%', fontWeight: 'bold' }}>+ Tambah Baris Bahan Baku</button>
                   </>
                 ) : (
                   <div>
-                    <p style={{ fontSize: '12px', color: '#555', marginBottom: '10px' }}>Upload dokumen rekapitulasi bahan baku yang sudah tersedia dari perusahaan (PDF akan otomatis dipecah per halaman kalau lebih dari 1 halaman).</p>
+                    <p style={{ fontSize: '12px', color: '#555', marginBottom: '10px' }}>Upload dokumen rekapitulasi bahan baku yang sudah tersedia dari perusahaan (PDF akan otomatis dipangkas atau dapat di-crop manual per halaman).</p>
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                      <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => setFileRekapBahanBaku(e.target.files[0])} style={{ flex: 1 }} />
-                      <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={setFileRekapBahanBaku} />
+                      <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateSingleFile('rekapBahanBaku', setFileRekapBahanBaku, e.target.files[0])} style={{ flex: 1 }} />
+                      <GDriveButton mimeTypes={MIME_DOKUMEN} onFile={(f) => updateSingleFile('rekapBahanBaku', setFileRekapBahanBaku, f)} />
                     </div>
-                    <ImagePreview file={fileRekapBahanBaku} targetWidth="Lebar penuh tabel" />
+                    <ImagePreview
+                      file={fileRekapBahanBaku}
+                      targetWidth="Lebar penuh tabel (16,5 cm)"
+                      customBlobs={customBlobsSingle.rekapBahanBaku?.blobs}
+                      onOpenCrop={() => setCropModal({
+                        file: fileRekapBahanBaku,
+                        isFormulir: true,
+                        initialRects: customBlobsSingle.rekapBahanBaku?.rectMeta,
+                        onApply: (blobs, rectMeta) => {
+                          setCustomBlobsSingle((prev) => ({ ...prev, rekapBahanBaku: { blobs, rectMeta } }));
+                          setCropModal(null);
+                        }
+                      })}
+                    />
                   </div>
                 )}
               </div>
@@ -1617,7 +2145,7 @@ useEffect(() => {
             )}
             {jenisLhv !== 'BMP' && (
               <>
-                <ReuseButton label='Gunakan file yang sama dari "Diagram Alur Proses Produksi" (Ringkasan Eksekutif)' onClick={() => salinFileTunggal(fileAlurProduksi, setFileAlurProsesLampiran, 'Alur Proses Produksi')} />
+                <ReuseButton label='Gunakan file yang sama dari "Diagram Alur Proses Produksi" (Dokumen Pendukung)' onClick={() => salinFileTunggal(fileAlurProduksi, 'alurProduksi', setFileAlurProsesLampiran, 'Alur Proses Produksi')} />
                 {renderDynamicBlock("e. Alur Proses Produksi Pabrik", fileAlurProsesLampiran, setFileAlurProsesLampiran)}
               </>
             )}
@@ -1625,13 +2153,13 @@ useEffect(() => {
             <h4 style={{ backgroundColor: '#e3f2fd', padding: '10px', borderRadius: '4px', color: '#0d47a1', marginTop: '30px' }}>3. Fasilitas Produksi (Pabrik)</h4>
             {renderDynamicBlock("a. Foto Lingkungan Pabrik / Fasilitas Produksi", fileBuktiPabrik, setFileBuktiPabrik)}
             {renderDynamicBlock("b. Foto Alat Kerja / Mesin Peralatan Produksi", fileFotoMesin, setFileFotoMesin)}
-            
+
             {jenisLhv !== 'BMP' && (
               <>
                 {renderDynamicBlock("c. Daftar Gaji Tenaga Kerja dan Kewarganegaraan", fileDaftarGaji, setFileDaftarGaji)}
                 <ReuseButton label='Gunakan file yang sama dari "Kartu Identitas Kewarganegaraan (KTP)" yang sudah diupload' onClick={() => salinDariDaftar(fileKtp, setFileSampelKtp, 'KTP Karyawan')} />
                 {renderDynamicBlock("d. Sampel Dokumen Identitas Tenaga Kerja (KTP)", fileSampelKtp, setFileSampelKtp)}
-                <ReuseButton label='Gunakan file yang sama dari "Struktur Organisasi" yang sudah diupload' onClick={() => salinFileTunggal(fileStruktur, setFileStrukturPabrik, 'Struktur Pabrik')} />
+                <ReuseButton label='Gunakan file yang sama dari "Struktur Organisasi" yang sudah diupload' onClick={() => salinFileTunggal(fileStruktur, 'struktur', setFileStrukturPabrik, 'Struktur Pabrik')} />
                 {renderDynamicBlock("e. Struktur Organisasi Pabrik", fileStrukturPabrik, setFileStrukturPabrik)}
                 {renderDynamicBlock("f. Daftar Penyusutan Alat Mesin", fileDaftarPenyusutan, setFileDaftarPenyusutan)}
                 {renderDynamicBlock("g. Bukti Pembayaran Token/Listrik", fileBuktiListrik, setFileBuktiListrik)}
@@ -1647,17 +2175,17 @@ useEffect(() => {
         {/* NAVIGASI TOMBOL FOOTER */}
         <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '40px', borderTop: '2px solid #eee', paddingTop: '20px' }}>
           <div>
-            <button 
-              type="button" 
-              onClick={() => { saveDraft(); setActiveTab(prev => prev > 1 ? prev - 1 : prev); }} 
-              disabled={activeTab === 1} 
+            <button
+              type="button"
+              onClick={() => { saveDraft(); setActiveTab(prev => prev > 1 ? prev - 1 : prev); }}
+              disabled={activeTab === 1}
               style={{ padding: '10px 20px', backgroundColor: activeTab === 1 ? '#e0e0e0' : '#fff', color: '#333', border: '1px solid #ccc', borderRadius: '4px', cursor: 'pointer', marginRight: '10px' }}
             >
               &laquo; Sebelumnya
             </button>
-            <button 
-              type="button" 
-              onClick={hapusDraft} 
+            <button
+              type="button"
+              onClick={hapusDraft}
               style={{ padding: '10px 15px', backgroundColor: '#ffebee', color: '#c62828', border: '1px solid #ffcdd2', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
             >
               🗑️ Mulai Laporan Baru (Hapus Draft)
@@ -1665,25 +2193,34 @@ useEffect(() => {
           </div>
 
           {activeTab < 5 ? (
-          <button 
-            type="button" 
-            onClick={() => { saveDraft(); setActiveTab(activeTab + 1); }} 
-            style={{ padding: '10px 20px', backgroundColor: '#1976d2', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
-          >
-            Selanjutnya &raquo;
-          </button>
-        ) : (
-          <button 
-            type="submit" 
-            style={{ padding: '15px 30px', backgroundColor: '#2e7d32', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}
-          >
-            💾 Simpan & Generate Word LHV
-          </button>
-        )}
+            <button
+              type="button"
+              onClick={() => { saveDraft(); setActiveTab(activeTab + 1); }}
+              style={{ padding: '10px 20px', backgroundColor: '#1976d2', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
+            >
+              Selanjutnya &raquo;
+            </button>
+          ) : (
+            <button
+              type="submit"
+              style={{ padding: '15px 30px', backgroundColor: '#2e7d32', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}
+            >
+              💾 Simpan &amp; Generate Word LHV
+            </button>
+          )}
         </div>
       </form>
-    </div>
-  )
-}
 
-// (tidak ada export ES module - App dipasang lewat ReactDOM di index.html)
+      {/* MODAL PRATINJAU & CROP PDF */}
+      {cropModal && (
+        <PdfCropModal
+          file={cropModal.file}
+          isFormulir={cropModal.isFormulir}
+          initialRects={cropModal.initialRects}
+          onSave={cropModal.onApply}
+          onClose={() => setCropModal(null)}
+        />
+      )}
+    </div>
+  );
+}

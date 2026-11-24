@@ -236,7 +236,7 @@
   }
 
   // =========================================================================
-  // 3. ESCAPE DATA KONTEKS & PENGUNCIAN TATA LETAK CETAK
+  // 3. ESCAPE DATA KONTEKS, SANITASI OPENXML & PENGUNCIAN TATA LETAK CETAK
   // =========================================================================
   function escapeContext(val) {
     if (val === null || val === undefined) return "";
@@ -273,30 +273,6 @@
   }
 
   /**
-   * Cari tag Jinja pertama yang menyebabkan error saat dikompilasi/dirender Nunjucks.
-   */
-  function findBrokenTag(env, preparedXml, renderCtx) {
-    const tags = preparedXml.match(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g) || [];
-    for (const tag of tags) {
-      if (/^\{\{/.test(tag)) {
-        try {
-          env.renderString(tag, renderCtx);
-        } catch (e) {
-          return `${tag} -> ${e.message}`;
-        }
-      }
-    }
-    // Cek blok kontrol tidak berpasangan atau rusak
-    const ctrlTags = preparedXml.match(/\{%[\s\S]*?%\}/g) || [];
-    for (const ct of ctrlTags) {
-      if (/\{%[\s\S]*?\{%/.test(ct)) {
-        return `Tag tumpang tindih: ${ct.slice(0, 120)}`;
-      }
-    }
-    return `Jumlah tag kontrol: ${ctrlTags.length} | Contoh awal: ${ctrlTags.slice(0, 5).join(" ")}`;
-  }
-
-  /**
    * Pastikan setiap baris tabel (<w:tr>) yang berisi gambar memiliki properti
    * <w:cantSplit/> agar gambar dan keterangannya tidak terbelah di antara dua halaman.
    */
@@ -308,6 +284,46 @@
       }
       return match.replace(/(<w:tr\b[^>]*>)/, "$1<w:trPr><w:cantSplit/></w:trPr>");
     });
+  }
+
+  /**
+   * Pastikan struktur XML valid menurut spesifikasi OpenXML Word:
+   * - Setiap sel tabel <w:tc> wajib memiliki minimal 1 <w:p> di dalamnya.
+   * - Setiap baris tabel <w:tr> wajib memiliki minimal 1 <w:tc> (jika kosong akibat loop, hapus baris).
+   * - Hapus run teks kosong <w:t xml:space="preserve"></w:t> sisa pemecahan gambar.
+   */
+  function sanitizeWordXml(xmlString) {
+    let out = xmlString;
+
+    // 1. Hapus <w:tr> yang tidak memiliki satu pun <w:tc>
+    out = out.replace(/<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/g, (match, inner) => {
+      return /<w:tc\b/.test(inner) ? match : "";
+    });
+
+    // 2. Pastikan setiap <w:tc> memiliki minimal satu <w:p> (syarat wajib skema Word)
+    out = out.replace(/<w:tc\b[^>]*>([\s\S]*?)<\/w:tc>/g, (match, inner) => {
+      if (/<w:p\b/.test(inner)) return match;
+      return match.replace("</w:tc>", "<w:p/></w:tc>");
+    });
+
+    // 3. Bersihkan <w:r> kosong yang hanya berisi <w:t></w:t> tanpa teks
+    out = out.replace(/<w:r>\s*<w:t(?:\s+xml:space="preserve")?><\/w:t>\s*<\/w:r>/g, "");
+
+    return out;
+  }
+
+  /**
+   * Validasi XML menggunakan DOMParser browser sebelum file .docx diunduh.
+   */
+  function validateXmlStructure(xmlString, xmlPath) {
+    if (typeof DOMParser === "undefined") return;
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlString, "application/xml");
+    const parseErr = doc.querySelector("parsererror");
+    if (parseErr) {
+      const msg = (parseErr.textContent || "").replace(/\s+/g, " ").trim().slice(0, 260);
+      throw new Error(`Struktur XML tidak valid pada ${xmlPath}: ${msg}`);
+    }
   }
 
   // =========================================================================
@@ -329,7 +345,7 @@
     if (Array.isArray(context.rekap_bahan_baku) && context.rekap_bahan_baku.length > 0) {
       safeCtx.tabel_rekap = buildBahanBakuTableXml(context.rekap_bahan_baku);
     } else {
-      safeCtx.tabel_rekap = "";
+      safeCtx.tabel_rekap = "<w:p/>";
     }
 
     const relsPath = "word/_rels/document.xml.rels";
@@ -356,8 +372,7 @@
       try {
         rendered = env.renderString(prepared, renderCtx);
       } catch (err) {
-        const detail = findBrokenTag(env, prepared, renderCtx);
-        throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message} [${detail}]`);
+        throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
       }
 
       // Kunci baris tabel yang berisi gambar agar tidak terpotong antar halaman
@@ -412,11 +427,19 @@
           addedExts.add(norm.ext);
 
           const drawingXml = buildDrawingXml(rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
-          const replacement = `</w:t></w:r><w:r>${drawingXml}</w:r><w:r><w:t xml:space="preserve">`;
-          rendered = rendered.split(token).join(replacement);
+          // Sisipkan gambar di dalam <w:r> secara aman baik berada di dalam <w:t> maupun langsung di <w:p>
+          rendered = rendered.replace(new RegExp(`(<w:t\\b[^>]*>)([^<]*)${token}([^<]*)(</w:t>)`, "g"), (m, tOpen, before, after, tClose) => {
+            const partBefore = before ? `${tOpen}${before}${tClose}` : "";
+            const partAfter = after ? `${tOpen}${after}${tClose}` : "";
+            return `${partBefore}</w:r><w:r>${drawingXml}</w:r><w:r>${partAfter}`;
+          });
+          // Fallback jika token berada di luar <w:t>
+          rendered = rendered.split(token).join(`<w:r>${drawingXml}</w:r>`);
         }
       }
 
+      rendered = sanitizeWordXml(rendered);
+      validateXmlStructure(rendered, xmlPath);
       zip.file(xmlPath, rendered);
     }
 

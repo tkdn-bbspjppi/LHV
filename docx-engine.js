@@ -124,7 +124,8 @@
       `<w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
       `<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
       `<w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-      `</w:tblBorders></w:tblPr>`;
+      `</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr>` +
+      `<w:tblGrid><w:gridCol w:w="700"/><w:gridCol w:w="3200"/><w:gridCol w:w="3200"/><w:gridCol w:w="1400"/></w:tblGrid>`;
     xml += row(["No", "Bahan Baku", "Produsen/Pemasok", "Asal"], true, true);
     rows.forEach((r) => {
       xml += row([String(r.no), r.nama_bahan, r.produsen, r.asal], false, false);
@@ -139,7 +140,9 @@
   function cleanText(s) {
     return String(s || "")
       .replace(/[\u200B-\u200D\uFEFF]/g, "")
-      .replace(/\u00A0/g, " ");
+      .replace(/\u00A0/g, " ")
+      .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+      .replace(/[\u2018\u2019\u201A\u201B]/g, "'");
   }
 
   function normalizeJinjaExpression(tagStr) {
@@ -303,7 +306,17 @@
       r.parentNode.replaceChild(frag, r);
     }
 
-    return new XMLSerializer().serializeToString(doc);
+    // XMLSerializer mengubah > < & " ' di dalam tag Jinja menjadi entity,
+    // padahal Nunjucks butuh karakter aslinya (mis. {% if x > 0 %}).
+    const serialized = new XMLSerializer().serializeToString(doc);
+    return serialized.replace(/\{%[\s\S]*?%\}|\{\{[\s\S]*?\}\}/g, (tag) =>
+      tag
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, "&")
+    );
   }
 
   // =========================================================================
@@ -473,56 +486,72 @@
 
     // Serialisasi DOM ke string XML dulu, BARU sisipkan <w:drawing> murni agar namespace tidak diubah XMLSerializer
     let finalXml = new XMLSerializer().serializeToString(doc);
-    let docPrCounter = docPrStart;
 
-    if (xmlPath === "word/document.xml" && imageJobs && imageJobs.size > 0) {
+    // Gambar diproses di document.xml DAN header/footer (relasi ditulis per-bagian oleh generateDocx)
+    if (imageJobs && imageJobs.size > 0) {
+      const partRelIds = new Map(); // token -> rId untuk bagian XML ini
       for (const [token, job] of imageJobs.entries()) {
         if (!finalXml.includes(token)) continue;
-        const norm = await normalizeImageForWord(job.blob);
-        const natural = await getImageNaturalSize(job.blob).catch(() => ({ width: 400, height: 300 }));
 
-        let cx, cy;
-        const maxHeightMm = job.widthMm && job.widthMm <= 80 ? 105 : 210;
-        const maxCy = Math.round(maxHeightMm * EMU_PER_MM);
+        // Normalisasi + tulis file media sekali saja per token (dipakai ulang antar bagian)
+        if (!job._media) {
+          const norm = await normalizeImageForWord(job.blob);
+          const natural = await getImageNaturalSize(job.blob).catch(() => ({ width: 400, height: 300 }));
 
-        if (job.widthMm) {
-          cx = Math.round(job.widthMm * EMU_PER_MM);
-          cy = Math.round(cx * (natural.height / natural.width));
-          if (cy > maxCy) {
-            const ratio = maxCy / cy;
-            cx = Math.round(cx * ratio);
-            cy = maxCy;
+          let cx, cy;
+          const maxHeightMm =
+            job.maxHeightMm || (job.widthMm && job.widthMm <= 80 ? 105 : 210);
+          const maxCy = Math.round(maxHeightMm * EMU_PER_MM);
+
+          if (job.widthMm) {
+            cx = Math.round(job.widthMm * EMU_PER_MM);
+            cy = Math.round(cx * (natural.height / natural.width));
+            if (cy > maxCy) {
+              const ratio = maxCy / cy;
+              cx = Math.round(cx * ratio);
+              cy = maxCy;
+            }
+          } else {
+            cx = Math.round(natural.width * EMU_PER_PX_96DPI);
+            cy = Math.round(natural.height * EMU_PER_PX_96DPI);
+            const maxCx = 165 * EMU_PER_MM;
+            if (cx > maxCx) {
+              const ratio = maxCx / cx;
+              cx = Math.round(cx * ratio);
+              cy = Math.round(cy * ratio);
+            }
+            if (cy > maxCy) {
+              const ratio = maxCy / cy;
+              cx = Math.round(cx * ratio);
+              cy = maxCy;
+            }
           }
-        } else {
-          cx = Math.round(natural.width * EMU_PER_PX_96DPI);
-          cy = Math.round(natural.height * EMU_PER_PX_96DPI);
-          const maxCx = 165 * EMU_PER_MM;
-          if (cx > maxCx) {
-            const ratio = maxCx / cx;
-            cx = Math.round(cx * ratio);
-            cy = Math.round(cy * ratio);
-          }
-          if (cy > maxCy) {
-            const ratio = maxCy / cy;
-            cx = Math.round(cx * ratio);
-            cy = maxCy;
-          }
+
+          const mediaIndex = imageJobs._nextMedia++;
+          const mediaFile = `media/img_${mediaIndex}.${norm.ext}`;
+          zip.file(`word/${mediaFile}`, norm.buffer);
+          addedExts.add(norm.ext);
+          job._media = { mediaFile, ext: norm.ext, cx, cy };
         }
 
-        const rId = allocRelId();
-        const docPrId = docPrCounter++;
-        const mediaFile = `media/img_${docPrId}.${norm.ext}`;
-        zip.file(`word/${mediaFile}`, norm.buffer);
-        addedExts.add(norm.ext);
+        const media = job._media;
+        let rId = partRelIds.get(token);
+        if (!rId) {
+          rId = allocRelId();
+          partRelIds.set(token, rId);
+          imageJobs._newRels.push(
+            `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${media.mediaFile}"/>`
+          );
+        }
 
-        const relTag = `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${mediaFile}"/>`;
-        imageJobs._newRels.push(relTag);
-
-        const drawingXml = buildDrawingXml(rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
-        // Ganti <w:t ...>...token...</w:t> di dalam <w:r> secara presisi
+        // Setiap kemunculan token mendapat docPr id BARU (id ganda membuat Word protes)
         finalXml = finalXml.replace(
           new RegExp(`(<w:t\\b[^>]*>)([^<]*)${token}([^<]*)(</w:t>)`, "g"),
           (_, tOpen, before, after, tClose) => {
+            const docPrId = imageJobs._nextDocPr++;
+            const drawingXml = buildDrawingXml(
+              rId, docPrId, `img_${docPrId}.${media.ext}`, media.cx, media.cy
+            );
             const bPart = before ? `${tOpen}${before}${tClose}` : "";
             const aPart = after ? `${tOpen}${after}${tClose}` : "";
             return `${bPart}${drawingXml}${aPart}`;
@@ -556,10 +585,31 @@
         : `<w:p xmlns:w="${W_NS}"/>`;
 
     const relsPath = "word/_rels/document.xml.rels";
-    let relsXml = await zip.file(relsPath).async("string");
     let contentTypesXml = await zip.file("[Content_Types].xml").async("string");
 
-    const usedRelIds = new Set([...relsXml.matchAll(/Id="([^"]+)"/g)].map((m) => m[1]));
+    const xmlTargets = Object.keys(zip.files).filter(
+      (p) => p === "word/document.xml" || /^word\/(header|footer)\d+\.xml$/.test(p)
+    );
+    const relsPathFor = (xmlPath) =>
+      xmlPath === "word/document.xml"
+        ? relsPath
+        : xmlPath.replace(/^word\//, "word/_rels/") + ".rels";
+
+    // Kumpulkan semua rId yang sudah dipakai (document + header/footer) & id docPr tertinggi
+    const usedRelIds = new Set();
+    let maxDocPr = 100;
+    const rawByPath = {};
+    for (const xmlPath of xmlTargets) {
+      rawByPath[xmlPath] = await zip.file(xmlPath).async("string");
+      for (const m of rawByPath[xmlPath].matchAll(/<wp:docPr\b[^>]*\bid="(\d+)"/g)) {
+        maxDocPr = Math.max(maxDocPr, parseInt(m[1], 10));
+      }
+      const rf = zip.file(relsPathFor(xmlPath));
+      if (rf) {
+        const txt = await rf.async("string");
+        for (const m of txt.matchAll(/Id="([^"]+)"/g)) usedRelIds.add(m[1]);
+      }
+    }
     let nextRelNum = 100;
     const allocRelId = () => {
       while (usedRelIds.has(`rId${nextRelNum}`)) nextRelNum++;
@@ -570,17 +620,12 @@
 
     const addedExts = new Set();
     const jobs = imageJobs || new Map();
-    jobs._newRels = [];
-
-    const xmlTargets = Object.keys(zip.files).filter(
-      (p) => p === "word/document.xml" || /^word\/(header|footer)\d+\.xml$/.test(p)
-    );
+    jobs._nextMedia = 1;
+    jobs._nextDocPr = maxDocPr + 10;
+    const newRelsByPart = {};
 
     for (const xmlPath of xmlTargets) {
-      const rawXml = await zip.file(xmlPath).async("string");
-
-      const existingDocPrIds = [...rawXml.matchAll(/<wp:docPr\b[^>]*\bid="(\d+)"/g)].map((m) => parseInt(m[1], 10));
-      const docPrStart = (existingDocPrIds.length ? Math.max(...existingDocPrIds) : 100) + 10;
+      const rawXml = rawByPath[xmlPath];
 
       const prepared = preprocessDocxDom(rawXml);
       const renderCtx = Object.assign({}, safeCtx);
@@ -593,21 +638,30 @@
         throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
       }
 
+      jobs._newRels = [];
       const finalized = await finalizeWordXml(
         rendered,
         xmlPath,
         zip,
         jobs,
         allocRelId,
-        docPrStart,
+        0,
         addedExts,
         rekapXml
       );
       zip.file(xmlPath, finalized);
+      if (jobs._newRels.length > 0) newRelsByPart[xmlPath] = jobs._newRels.slice();
     }
 
-    if (jobs._newRels.length > 0) {
-      relsXml = relsXml.replace("</Relationships>", `${jobs._newRels.join("")}</Relationships>`);
+    // Tulis relasi gambar ke file .rels milik masing-masing bagian (buat baru jika belum ada)
+    for (const [xmlPath, rels] of Object.entries(newRelsByPart)) {
+      const rp = relsPathFor(xmlPath);
+      const existing = zip.file(rp);
+      let rx = existing
+        ? await existing.async("string")
+        : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+      rx = rx.replace("</Relationships>", `${rels.join("")}</Relationships>`);
+      zip.file(rp, rx);
     }
 
     for (const ext of addedExts) {
@@ -621,7 +675,6 @@
       }
     }
 
-    zip.file(relsPath, relsXml);
     zip.file("[Content_Types].xml", contentTypesXml);
 
     return await zip.generateAsync({

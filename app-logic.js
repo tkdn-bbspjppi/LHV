@@ -595,7 +595,7 @@
   // 5. PENYIMPANAN PROYEK LOKAL (INDEXEDDB)
   // =========================================================================
   const DB_NAME = "lhv_generator_db";
-  const DB_VERSION = 3;
+  const DB_VERSION = 5;
   const STORE_PROJECTS = "projects";
   const STORE_DRAFT = "draft";
 
@@ -616,10 +616,18 @@
         }
       };
       req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onerror = () => {
+        // Jika versi di browser masih lebih tinggi, buka tanpa parameter versi
+        if (req.error && req.error.name === "VersionError") {
+          const fallbackReq = indexedDB.open(DB_NAME);
+          fallbackReq.onsuccess = () => resolve(fallbackReq.result);
+          fallbackReq.onerror = () => reject(fallbackReq.error);
+        } else {
+          reject(req.error);
+        }
+      };
     });
   }
-
   async function dbSaveProject(project) {
     const db = await openDb();
     return new Promise((resolve, reject) => {

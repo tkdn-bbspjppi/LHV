@@ -229,7 +229,7 @@
   }
 
   // =========================================================================
-  // 3. ESCAPE DATA KONTEKS, SAFE PROXY & PENGUNCIAN TATA LETAK CETAK
+  // 3. ESCAPE DATA KONTEKS & PENGUNCIAN TATA LETAK CETAK
   // =========================================================================
   function escapeContext(val) {
     if (val === null || val === undefined) return "";
@@ -247,35 +247,26 @@
   }
 
   /**
-   * Bungkus konteks dengan Proxy agar setiap variabel yang tidak ada di context
-   * otomatis mengembalikan "" (memiliki .length === 0 dan aman di-loop).
+   * Kumpulkan seluruh nama variabel yang direferensikan di dalam tag {{ ... }} atau {% ... %}
+   * lalu isi default "" bila belum ada di safeCtx agar Nunjucks tidak pernah menemui undefined.
    */
-  function createSafeContextProxy(obj) {
-    if (!obj || typeof obj !== "object") return obj;
-    const ignoredProps = new Set([
-      "then", "__proto__", "prototype", "constructor", "toJSON", "valueOf", "toString"
+  function ensureAllTemplateVarsDefined(preparedXml, ctxObj) {
+    const keywords = new Set([
+      "if", "elif", "else", "endif", "for", "in", "endfor", "set", "block", "endblock",
+      "extends", "include", "import", "from", "as", "macro", "endmacro", "call", "endcall",
+      "filter", "endfilter", "raw", "endraw", "and", "or", "not", "is", "true", "false",
+      "none", "null", "undefined", "loop", "super", "self", "true", "false", "length", "safe"
     ]);
-    return new Proxy(obj, {
-      has(target, prop) {
-        if (typeof prop === "symbol" || ignoredProps.has(prop)) {
-          return prop in target;
+    const tags = preparedXml.match(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g) || [];
+    for (const tag of tags) {
+      const inner = tag.slice(2, -2);
+      const idents = inner.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || [];
+      for (const id of idents) {
+        if (!keywords.has(id) && !(id in ctxObj)) {
+          ctxObj[id] = "";
         }
-        return true;
-      },
-      get(target, prop, receiver) {
-        if (typeof prop === "symbol") {
-          return Reflect.get(target, prop, receiver);
-        }
-        if (prop in target) {
-          const val = target[prop];
-          return val === undefined || val === null ? "" : val;
-        }
-        if (ignoredProps.has(prop)) {
-          return undefined;
-        }
-        return "";
-      },
-    });
+      }
+    }
   }
 
   /**
@@ -313,7 +304,6 @@
     } else {
       safeCtx.tabel_rekap = "";
     }
-    const proxiedCtx = createSafeContextProxy(safeCtx);
 
     const relsPath = "word/_rels/document.xml.rels";
     let relsXml = await zip.file(relsPath).async("string");
@@ -331,11 +321,23 @@
     for (const xmlPath of xmlTargets) {
       const rawXml = await zip.file(xmlPath).async("string");
       const prepared = preprocessDocxXml(rawXml);
+
+      // Pastikan seluruh identifier yang dipakai di template tersedia di safeCtx
+      const renderCtx = Object.assign({}, safeCtx);
+      ensureAllTemplateVarsDefined(prepared, renderCtx);
+
       let rendered;
       try {
-        rendered = env.renderString(prepared, proxiedCtx);
+        rendered = env.renderString(prepared, renderCtx);
       } catch (err) {
-        throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
+        const lineMatch = err.message.match(/\[Line\s+(\d+)/i);
+        let hint = "";
+        if (lineMatch) {
+          const lines = prepared.split("\n");
+          const ln = Math.max(0, parseInt(lineMatch[1], 10) - 1);
+          hint = ` | Potongan: ${String(lines[ln] || "").slice(0, 180)}`;
+        }
+        throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}${hint}`);
       }
 
       // Kunci baris tabel yang berisi gambar agar tidak terpotong antar halaman

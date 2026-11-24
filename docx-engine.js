@@ -8,10 +8,6 @@
   const EMU_PER_MM = 36000;
   const EMU_PER_PX_96DPI = 9525;
   const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-  const WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
-  const A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main";
-  const PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture";
-  const R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
   // =========================================================================
   // 1. UTILITAS GAMBAR & XML
@@ -70,25 +66,26 @@
     }
   }
 
-  function createDrawingElement(doc, rId, docPrId, name, cx, cy) {
-    const drawingXml =
-      `<w:drawing xmlns:w="${W_NS}">` +
-      `<wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="${WP_NS}">` +
+  function buildDrawingXml(rId, docPrId, name, cx, cy) {
+    return (
+      `<w:drawing>` +
+      `<wp:inline distT="0" distB="0" distL="0" distR="0"` +
+      ` xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">` +
       `<wp:extent cx="${cx}" cy="${cy}"/>` +
       `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
       `<wp:docPr id="${docPrId}" name="${escapeXml(name)}"/>` +
       `<wp:cNvGraphicFramePr>` +
-      `<a:graphicFrameLocks xmlns:a="${A_NS}" noChangeAspect="1"/>` +
+      `<a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>` +
       `</wp:cNvGraphicFramePr>` +
-      `<a:graphic xmlns:a="${A_NS}">` +
+      `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
       `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
-      `<pic:pic xmlns:pic="${PIC_NS}">` +
+      `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
       `<pic:nvPicPr>` +
       `<pic:cNvPr id="${docPrId}" name="${escapeXml(name)}"/>` +
       `<pic:cNvPicPr/>` +
       `</pic:nvPicPr>` +
       `<pic:blipFill>` +
-      `<a:blip r:embed="${rId}" xmlns:r="${R_NS}"/>` +
+      `<a:blip r:embed="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>` +
       `<a:stretch><a:fillRect/></a:stretch>` +
       `</pic:blipFill>` +
       `<pic:spPr>` +
@@ -99,9 +96,8 @@
       `</a:graphicData>` +
       `</a:graphic>` +
       `</wp:inline>` +
-      `</w:drawing>`;
-    const parsed = new DOMParser().parseFromString(drawingXml, "application/xml");
-    return doc.importNode(parsed.documentElement, true);
+      `</w:drawing>`
+    );
   }
 
   function buildBahanBakuTableXml(rows) {
@@ -138,7 +134,7 @@
   }
 
   // =========================================================================
-  // 2. PRE-PROCESSING XML WORD BERBASIS DOM (SEMUA SINTAKS DOCXTPL)
+  // 2. PRE-PROCESSING XML WORD BERBASIS DOM
   // =========================================================================
   function cleanText(s) {
     return String(s || "")
@@ -177,14 +173,6 @@
     return null;
   }
 
-  /**
-   * Memproses XML Word menggunakan DOMParser sehingga:
-   * 1. Semua tag terpecah lintas <w:r>/<w:t> di satu paragraf digabung utuh.
-   * 2. Tag khusus docxtpl ({% tr ... %}, {% tc ... %}, {% p ... %}, {% r ... %})
-   *    dan tag kontrol paragraf tunggal ({% if/for/elif/else/endif/endfor %})
-   *    ditempatkan tepat di luar elemen XML pembungkusnya sehingga tidak pernah
-   *    memotong <w:t>, <w:r>, <w:p>, <w:tc>, atau <w:tr>.
-   */
   function preprocessDocxDom(rawXml) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(rawXml, "application/xml");
@@ -195,7 +183,7 @@
 
     unwrapContentControls(doc);
 
-    // Tahap 1: Gabungkan seluruh run <w:t> di setiap paragraf <w:p> yang mengandung {{ atau {%
+    // Tahap 1: Gabungkan run terpecah <w:t> dalam tiap paragraf <w:p>
     const paragraphs = Array.from(doc.getElementsByTagNameNS(W_NS, "p"));
     for (const p of paragraphs) {
       const tNodes = Array.from(p.getElementsByTagNameNS(W_NS, "t"));
@@ -204,13 +192,11 @@
       const fullText = cleanText(tNodes.map((t) => t.textContent || "").join(""));
       if (!/\{\{|\{%|\{#/.test(fullText)) continue;
 
-      // Placeholder tabel rekapitulasi bahan baku
       if (/^\{\{\s*tabel_rekap\s*\}\}$/.test(fullText.trim())) {
         p.parentNode.replaceChild(doc.createTextNode("§§TABEL_REKAP§§"), p);
         continue;
       }
 
-      // Normalisasi ekspresi Jinja di dalam paragraf
       const normalized = fullText.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) =>
         normalizeJinjaExpression(tag)
       );
@@ -222,13 +208,12 @@
       }
     }
 
-    // Tahap 2: Ekstrak tag kontrol docxtpl ke level elemen struktural yang tepat
+    // Tahap 2: Ekstrak tag kontrol docxtpl (tr, tc, p, r)
     const allT = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
     for (const t of allT) {
       let txt = t.textContent || "";
       if (!txt.includes("{%")) continue;
 
-      // 2a. {% tr ... %} -> bungkus <w:tr>
       const trEl = findAncestor(t, "tr");
       if (trEl) {
         txt = txt.replace(/\{%-?\s*tr\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
@@ -241,7 +226,6 @@
         });
       }
 
-      // 2b. {% tc ... %} -> bungkus <w:tc>
       const tcEl = findAncestor(t, "tc");
       if (tcEl) {
         txt = txt.replace(/\{%-?\s*tc\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
@@ -254,7 +238,6 @@
         });
       }
 
-      // 2c. {% p ... %} -> bungkus <w:p>
       const pEl = findAncestor(t, "p");
       if (pEl) {
         txt = txt.replace(/\{%-?\s*p\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
@@ -267,7 +250,6 @@
         });
       }
 
-      // 2d. {% r ... %} -> bungkus <w:r>
       const rEl = findAncestor(t, "r");
       if (rEl) {
         txt = txt.replace(/\{%-?\s*r\s+(for\b[\s\S]*?|if\b[\s\S]*?)-?%\}/g, (_, expr) => {
@@ -283,8 +265,7 @@
       t.textContent = txt;
     }
 
-    // Tahap 3: Paragraf yang isinya murni tag kontrol ({% if/for/else/elif/endif/endfor %})
-    // dipindahkan keluar dari <w:p> agar tidak menyisakan baris kosong dan tidak memotong <w:t>
+    // Tahap 3: Paragraf yang hanya berisi tag kontrol dipindahkan ke luar <w:p>
     const paragraphsAfter = Array.from(doc.getElementsByTagNameNS(W_NS, "p"));
     for (const p of paragraphsAfter) {
       const tNodes = Array.from(p.getElementsByTagNameNS(W_NS, "t"));
@@ -294,8 +275,7 @@
       }
     }
 
-    // Tahap 4: Jika di dalam satu paragraf terdapat tag kontrol {% ... %} bercampur teks biasa,
-    // pecah menjadi <w:r> terpisah sehingga blok {% if %} tidak pernah menelan </w:t> milik teks lain
+    // Tahap 4: Pisahkan tag kontrol {% ... %} yang bercampur teks dalam satu <w:r>
     const runsWithCtrl = Array.from(doc.getElementsByTagNameNS(W_NS, "r"));
     for (const r of runsWithCtrl) {
       const tNodes = Array.from(r.getElementsByTagNameNS(W_NS, "t"));
@@ -327,7 +307,7 @@
   }
 
   // =========================================================================
-  // 3. ESCAPE KONTEKS, PEMULIH TAG XML & SANITASI DOM AKHIR
+  // 3. ESCAPE KONTEKS, PEMULIH TAG XML & SANITASI OPENXML
   // =========================================================================
   function escapeContext(val) {
     if (val === null || val === undefined) return "";
@@ -363,10 +343,6 @@
     }
   }
 
-  /**
-   * Memperbaiki ketidakseimbangan tag XML apabila template .docx memiliki blok
-   * {% if ... %} yang membentang melintasi batas sel tabel (<w:tc>) atau baris (<w:tr>).
-   */
   function repairMismatchedXmlTags(xmlString) {
     const tokenRegex = /<(\/?)([a-zA-Z0-9_:-]+)([^>]*)>/g;
     const stack = [];
@@ -379,7 +355,6 @@
       out += xmlString.slice(lastIndex, m.index);
       lastIndex = m.index + full.length;
 
-      // Lewati deklarasi <?xml ...?>, komentar <!-- -->, atau self-closing <tag .../>
       if (tagName.startsWith("?") || tagName.startsWith("!") || attrs.endsWith("/")) {
         out += full;
         continue;
@@ -390,14 +365,9 @@
         out += full;
       } else {
         const idx = stack.lastIndexOf(tagName);
-        if (idx === -1) {
-          // Tag penutup yatim tanpa pembuka -> buang
-          continue;
-        }
-        // Tutup semua tag di atasnya yang belum sempat ditutup sebelum tagName ditutup
+        if (idx === -1) continue;
         while (stack.length - 1 > idx) {
-          const unclosed = stack.pop();
-          out += `</${unclosed}>`;
+          out += `</${stack.pop()}>`;
         }
         stack.pop();
         out += full;
@@ -410,15 +380,7 @@
     return out;
   }
 
-  /**
-   * Sanitasi akhir menggunakan DOMParser:
-   * - Sisipkan tabel rekapitulasi bahan baku (§§TABEL_REKAP§§)
-   * - Sisipkan seluruh gambar (<w:drawing>) langsung ke dalam <w:r>
-   * - Konversi baris baru (§§BR§§) menjadi <w:br/>
-   * - Kunci baris tabel bergambar dengan <w:cantSplit/>
-   * - Pastikan seluruh <w:tc> dan <w:tr> memenuhi aturan wajib skema OpenXML Word
-   */
-  async function finalizeWordDom(xmlString, xmlPath, zip, imageJobs, allocRelId, docPrStart, addedExts, rekapXml) {
+  async function finalizeWordXml(xmlString, xmlPath, zip, imageJobs, allocRelId, docPrStart, addedExts, rekapXml) {
     const repaired = repairMismatchedXmlTags(xmlString);
     const parser = new DOMParser();
     const doc = parser.parseFromString(repaired, "application/xml");
@@ -428,9 +390,7 @@
       throw new Error(`Struktur XML tidak valid pada ${xmlPath}: ${msg}`);
     }
 
-    let docPrCounter = docPrStart;
-
-    // 1. Ganti placeholder §§TABEL_REKAP§§ dengan elemen <w:tbl> asli
+    // 1. Ganti placeholder §§TABEL_REKAP§§ dengan elemen <w:tbl>
     const walker = doc.createTreeWalker(doc.documentElement, NodeFilter.SHOW_TEXT);
     const textNodes = [];
     let curNode;
@@ -445,13 +405,79 @@
       tn.parentNode.replaceChild(importedTbl, tn);
     }
 
-    // 2. Sisipkan gambar (<w:drawing>) menggantikan token §§IMG:...§§ di dalam <w:t>
+    // 2. Konversi token §§BR§§ menjadi <w:br/>
+    const allTForBr = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
+    for (const t of allTForBr) {
+      const txt = t.textContent || "";
+      if (!txt.includes("§§BR§§")) continue;
+      const lines = txt.split("§§BR§§");
+      const parentRun = t.parentNode;
+      t.textContent = lines[0];
+      t.setAttribute("xml:space", "preserve");
+      let refNode = t.nextSibling;
+      for (let i = 1; i < lines.length; i++) {
+        const br = doc.createElementNS(W_NS, "w:br");
+        const nextT = doc.createElementNS(W_NS, "w:t");
+        nextT.setAttribute("xml:space", "preserve");
+        nextT.textContent = lines[i];
+        parentRun.insertBefore(br, refNode);
+        parentRun.insertBefore(nextT, refNode);
+      }
+    }
+
+    // 3. Kunci baris tabel yang berisi gambar (§§IMG:) agar tidak terbelah antar halaman
+    const trList = Array.from(doc.getElementsByTagNameNS(W_NS, "tr"));
+    for (const tr of trList) {
+      if (tr.getElementsByTagNameNS(W_NS, "tc").length === 0) {
+        tr.parentNode.removeChild(tr);
+        continue;
+      }
+      if ((tr.textContent || "").includes("§§IMG:")) {
+        let trPr = tr.getElementsByTagNameNS(W_NS, "trPr")[0];
+        if (!trPr) {
+          trPr = doc.createElementNS(W_NS, "w:trPr");
+          tr.insertBefore(trPr, tr.firstChild);
+        }
+        if (trPr.getElementsByTagNameNS(W_NS, "cantSplit").length === 0) {
+          trPr.appendChild(doc.createElementNS(W_NS, "w:cantSplit"));
+        }
+      }
+    }
+
+    // 4. Pastikan setiap <w:tc> memenuhi aturan skema OpenXML Word
+    const tcList = Array.from(doc.getElementsByTagNameNS(W_NS, "tc"));
+    for (const tc of tcList) {
+      if (tc.getElementsByTagNameNS(W_NS, "p").length === 0) {
+        tc.appendChild(doc.createElementNS(W_NS, "w:p"));
+      } else {
+        const lastEl = tc.lastElementChild;
+        if (lastEl && lastEl.localName === "tbl") {
+          tc.appendChild(doc.createElementNS(W_NS, "w:p"));
+        }
+      }
+    }
+
+    // 5. Hapus seluruh text node liar di luar <w:t> (wajib bersih untuk skema Word)
+    const cleanWalker = doc.createTreeWalker(doc.documentElement, NodeFilter.SHOW_TEXT);
+    const orphanTexts = [];
+    let n;
+    while ((n = cleanWalker.nextNode())) {
+      const pLocal = n.parentNode && n.parentNode.localName;
+      if (pLocal !== "t" && pLocal !== "instrText" && pLocal !== "delText") {
+        orphanTexts.push(n);
+      }
+    }
+    for (const ot of orphanTexts) {
+      ot.parentNode.removeChild(ot);
+    }
+
+    // Serialisasi DOM ke string XML dulu, BARU sisipkan <w:drawing> murni agar namespace tidak diubah XMLSerializer
+    let finalXml = new XMLSerializer().serializeToString(doc);
+    let docPrCounter = docPrStart;
+
     if (xmlPath === "word/document.xml" && imageJobs && imageJobs.size > 0) {
       for (const [token, job] of imageJobs.entries()) {
-        const allT = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
-        const matchingT = allT.filter((t) => (t.textContent || "").includes(token));
-        if (matchingT.length === 0) continue;
-
+        if (!finalXml.includes(token)) continue;
         const norm = await normalizeImageForWord(job.blob);
         const natural = await getImageNaturalSize(job.blob).catch(() => ({ width: 400, height: 300 }));
 
@@ -492,81 +518,20 @@
         const relTag = `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${mediaFile}"/>`;
         imageJobs._newRels.push(relTag);
 
-        for (const tNode of matchingT) {
-          const runNode = findAncestor(tNode, "r");
-          if (!runNode) continue;
-          const parts = (tNode.textContent || "").split(token);
-          tNode.textContent = parts[0];
-          tNode.setAttribute("xml:space", "preserve");
-
-          let ref = tNode.nextSibling;
-          for (let i = 1; i < parts.length; i++) {
-            const drawingEl = createDrawingElement(doc, rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
-            runNode.insertBefore(drawingEl, ref);
-            if (parts[i]) {
-              const afterT = doc.createElementNS(W_NS, "w:t");
-              afterT.setAttribute("xml:space", "preserve");
-              afterT.textContent = parts[i];
-              runNode.insertBefore(afterT, ref);
-            }
+        const drawingXml = buildDrawingXml(rId, docPrId, `img_${docPrId}.${norm.ext}`, cx, cy);
+        // Ganti <w:t ...>...token...</w:t> di dalam <w:r> secara presisi
+        finalXml = finalXml.replace(
+          new RegExp(`(<w:t\\b[^>]*>)([^<]*)${token}([^<]*)(</w:t>)`, "g"),
+          (_, tOpen, before, after, tClose) => {
+            const bPart = before ? `${tOpen}${before}${tClose}` : "";
+            const aPart = after ? `${tOpen}${after}${tClose}` : "";
+            return `${bPart}${drawingXml}${aPart}`;
           }
-        }
+        );
       }
     }
 
-    // 3. Konversi token §§BR§§ menjadi <w:br/>
-    const allTForBr = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
-    for (const t of allTForBr) {
-      const txt = t.textContent || "";
-      if (!txt.includes("§§BR§§")) continue;
-      const lines = txt.split("§§BR§§");
-      const parentRun = t.parentNode;
-      t.textContent = lines[0];
-      t.setAttribute("xml:space", "preserve");
-      let refNode = t.nextSibling;
-      for (let i = 1; i < lines.length; i++) {
-        const br = doc.createElementNS(W_NS, "w:br");
-        const nextT = doc.createElementNS(W_NS, "w:t");
-        nextT.setAttribute("xml:space", "preserve");
-        nextT.textContent = lines[i];
-        parentRun.insertBefore(br, refNode);
-        parentRun.insertBefore(nextT, refNode);
-      }
-    }
-
-    // 4. Kunci baris tabel yang berisi gambar (<w:drawing>) agar tidak terbelah antar halaman
-    const trList = Array.from(doc.getElementsByTagNameNS(W_NS, "tr"));
-    for (const tr of trList) {
-      if (tr.getElementsByTagNameNS(W_NS, "tc").length === 0) {
-        tr.parentNode.removeChild(tr);
-        continue;
-      }
-      if (tr.getElementsByTagNameNS(W_NS, "drawing").length > 0) {
-        let trPr = tr.getElementsByTagNameNS(W_NS, "trPr")[0];
-        if (!trPr) {
-          trPr = doc.createElementNS(W_NS, "w:trPr");
-          tr.insertBefore(trPr, tr.firstChild);
-        }
-        if (trPr.getElementsByTagNameNS(W_NS, "cantSplit").length === 0) {
-          trPr.appendChild(doc.createElementNS(W_NS, "w:cantSplit"));
-        }
-      }
-    }
-
-    // 5. Pastikan setiap <w:tc> memenuhi aturan skema OpenXML Word (minimal 1 <w:p> & tidak diakhiri <w:tbl>)
-    const tcList = Array.from(doc.getElementsByTagNameNS(W_NS, "tc"));
-    for (const tc of tcList) {
-      if (tc.getElementsByTagNameNS(W_NS, "p").length === 0) {
-        tc.appendChild(doc.createElementNS(W_NS, "w:p"));
-      } else {
-        const lastEl = tc.lastElementChild;
-        if (lastEl && lastEl.localName === "tbl") {
-          tc.appendChild(doc.createElementNS(W_NS, "w:p"));
-        }
-      }
-    }
-
-    return new XMLSerializer().serializeToString(doc);
+    return finalXml;
   }
 
   // =========================================================================
@@ -628,7 +593,7 @@
         throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
       }
 
-      const finalized = await finalizeWordDom(
+      const finalized = await finalizeWordXml(
         rendered,
         xmlPath,
         zip,

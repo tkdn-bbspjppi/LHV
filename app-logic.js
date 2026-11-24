@@ -241,8 +241,19 @@
     );
   }
 
-  async function processSingleImage(fileOrBlob, customBlobs, widthMm, imageJobs, label, tick) {
-    const source = (Array.isArray(customBlobs) && customBlobs[0]) || fileOrBlob;
+  async function processSingleImage(fileOrBlob, customBlobs, widthMm, imageJobs, label, tick, maxHeightMm) {
+    // Hasil crop manual: semua halaman dipakai (token digabung spasi, seperti rekap bahan baku)
+    if (Array.isArray(customBlobs) && customBlobs.length > 0) {
+      tick && tick(`Memproses gambar: ${label}...`);
+      const tokens = [];
+      for (const b of customBlobs) {
+        const token = nextToken(label);
+        imageJobs.set(token, { blob: b, widthMm, maxHeightMm });
+        tokens.push(token);
+      }
+      return tokens.join(" ");
+    }
+    const source = fileOrBlob;
     if (!source) return "";
     tick && tick(`Memproses gambar: ${label}...`);
     let blob = source;
@@ -252,7 +263,7 @@
       blob = pages[0];
     }
     const token = nextToken(label);
-    imageJobs.set(token, { blob, widthMm });
+    imageJobs.set(token, { blob, widthMm, maxHeightMm });
     return token;
   }
 
@@ -444,7 +455,7 @@
     const strukturIndustriToken = await processSingleImage(
       state.fileStrukturIndustri, state.customBlobsStrukturIndustri, 70, imageJobs, "struktur_ind", tick
     );
-    const coverToken = await processSingleImage(state.fileCover, null, 210, imageJobs, "cover", tick);
+    const coverToken = await processSingleImage(state.fileCover, null, 210, imageJobs, "cover", tick, 297);
     const fotoBarangToken = await processSingleImage(state.fileFotoBarang, null, 70, imageJobs, "foto_barang", tick);
     const fotoProdukUtamaToken = await processSingleImage(state.fileFotoProdukUtama, null, 70, imageJobs, "foto_produk_utama", tick);
     step("Memproses cover, logo & gambar utama...");
@@ -599,7 +610,15 @@
   const STORE_PROJECTS = "projects";
   const STORE_DRAFT = "draft";
 
+  let dbPromise = null;
   function openDb() {
+    if (!dbPromise) {
+      dbPromise = openDbRaw().catch((e) => { dbPromise = null; throw e; });
+    }
+    return dbPromise;
+  }
+
+  function openDbRaw() {
     return new Promise((resolve, reject) => {
       if (!global.indexedDB) {
         reject(new Error("IndexedDB tidak didukung oleh browser ini."));
@@ -615,7 +634,11 @@
           db.createObjectStore(STORE_DRAFT, { keyPath: "key" });
         }
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => { db.close(); dbPromise = null; };
+        resolve(db);
+      };
       req.onerror = () => {
         // Jika versi di browser masih lebih tinggi, buka tanpa parameter versi
         if (req.error && req.error.name === "VersionError") {
@@ -628,9 +651,11 @@
       };
     });
   }
+  const MAX_PROJECTS = 10;
+
   async function dbSaveProject(project) {
     const db = await openDb();
-    return new Promise((resolve, reject) => {
+    const savedId = await new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_PROJECTS, "readwrite");
       const req = project.id
         ? tx.objectStore(STORE_PROJECTS).put(project)
@@ -638,6 +663,14 @@
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
+    // Batasi riwayat agar tidak melewati quota browser (File/Blob tersimpan utuh di tiap proyek)
+    try {
+      const all = await dbListProjects();
+      for (const old of all.slice(MAX_PROJECTS)) await dbDeleteProject(old.id);
+    } catch (e) {
+      console.warn("Gagal merapikan riwayat proyek:", e);
+    }
+    return savedId;
   }
 
   async function dbListProjects() {

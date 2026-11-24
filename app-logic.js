@@ -1,152 +1,141 @@
-/* ==========================================================================
-   APP LOGIC — Pengganti main.py (FastAPI) + database.py + models.py.
-   Semua proses (dulu di server Python) sekarang berjalan di browser:
-     - Membangun "context" persis seperti context dict di backend lama
-     - Mengekstrak gambar dari PDF (pengganti pypdf) via pdf.js -> render tiap
-       halaman PDF menjadi 1 gambar (pendekatan ini lebih stabil di browser
-       dibanding mengekstrak XObject gambar mentah dari dalam PDF)
-     - Menyimpan proyek (draft & tersimpan) ke IndexedDB, karena localStorage
-       terlalu kecil untuk menyimpan banyak file gambar
-     - Memanggil DocxEngine untuk menghasilkan file .docx dan mengunduhnya
-   ========================================================================== */
-
+/**
+ * app-logic.js -- Pengolah data form, gambar, PDF, nomor LHV,
+ * penyimpanan lokal (IndexedDB), serta pemanggil engine Word.
+ * Tidak membutuhkan backend/server (berjalan 100% di browser).
+ */
 (function (global) {
   "use strict";
 
-  const TEMPLATE_MAP = {
-    "Produksi Sendiri": "templates/Contoh_LHV_TKDN_2026.docx",
-    Kerjasama: "templates/Template_LHV_Kerjasama.docx",
-    BMP: "templates/Template_LHV_BMP.docx",
-    Jasa: "templates/Template_LHV_Jasa.docx",
-    Gabungan: "templates/Template_LHV_Gabungan.docx",
-  };
-
-  // Kategori gambar dinamis: { stateKey, category, contextKey, widthMm, shape }
-  // shape 'std'      -> item = { id, file, keterangan }
-  // shape 'formulir' -> item = { id, file, judul }
-  //
-  // "noDataLabel": kalau kategori ini TIDAK ADA berkas yang diunggah sama
-  // sekali, buildContext() otomatis mengisi 1 baris placeholder berbunyi
-  // "Tidak ada <noDataLabel>." menggantikan baris kosong -- supaya struktur
-  // LHV yang tergenerate tetap mengikuti urutan template, dan bagian yang
-  // memang tidak dimiliki perusahaan diberi keterangan eksplisit (bukan
-  // dibiarkan kosong begitu saja). Berlaku untuk skema TKDN maupun BMP,
-  // karena ini logika di lapisan data (buildContext), bukan per-template.
-  const CATEGORY_CONFIG = [
-    { stateKey: "formulirVerifikasi", contextKey: "formulir_tkdn", widthMm: null, shape: "formulir" },
-    { stateKey: "fileBuktiPabrik", contextKey: "bukti_pabrik", widthMm: 70, shape: "std", noDataLabel: "bukti kepemilikan pabrik / fasilitas produksi" },
-    { stateKey: "fileBom", contextKey: "gambar_bom", widthMm: 70, shape: "std", noDataLabel: "data rincian BoM / gambar teknik" },
-    { stateKey: "fileSertifikatTkdn", contextKey: "sertifikat_tkdn", widthMm: 70, shape: "std", noDataLabel: "sertifikat TKDN komponen utama" },
-    { stateKey: "fileBuktiBeli", contextKey: "bukti_beli", widthMm: 70, shape: "std", noDataLabel: "bukti pembelian komponen utama" },
-    { stateKey: "fileKtp", contextKey: "ktp_karyawan", widthMm: 70, shape: "std", noDataLabel: "kartu identitas kewarganegaraan (KTP)" },
-    { stateKey: "fileBuktiKerjasama", contextKey: "bukti_kerjasama", widthMm: 70, shape: "std", noDataLabel: "bukti kerja sama" },
-
-    // --------------------------------------------------------------------
-    // contextKey di bawah ini DISESUAIKAN PERSIS dengan nama tag Jinja2 di
-    // dalam Template_LHV_BMP.docx (mis. "{% for baris in penyerapan_tenaga_kerja
-    // | batch(2, None) %}"). Sebelumnya contextKey memakai nama lama
-    // ("bmp_tenagakerja" dst.) yang TIDAK COCOK dengan tag apa pun di
-    // template ini, sehingga semua bagian bukti pendukung BMP tampil
-    // kosong di dokumen hasil generate.
-    //
-    // Catatan khusus "industri_4_0": di template tag-nya tertulis
-    // "industri_4.0" (pakai titik), TAPI titik di Jinja2/nunjucks selalu
-    // berarti akses atribut sehingga nama itu tidak valid secara sintaks
-    // (nunjucks gagal parse). docx-engine.js (sanitizeBrokenTagNames)
-    // otomatis mengganti tag tsb jadi "industri_4_0" sebelum dirender --
-    // contextKey di sini HARUS "industri_4_0" juga supaya cocok.
-    // --------------------------------------------------------------------
-    { stateKey: "fileTenagaKerjaBmp", contextKey: "penyerapan_tenaga_kerja", widthMm: 70, shape: "std", noDataLabel: "bukti penyerapan tenaga kerja" },
-    { stateKey: "fileInvestasiBmp", contextKey: "investasi_baru", widthMm: 70, shape: "std", noDataLabel: "bukti penambahan investasi baru" },
-    { stateKey: "fileKemitraanBmp", contextKey: "kemitraan_rantai", widthMm: 70, shape: "std", noDataLabel: "bukti kemitraan dan penguatan rantai pasok" },
-    { stateKey: "fileSubstitusiBmp", contextKey: "pionir_substitusi", widthMm: 70, shape: "std", noDataLabel: "bukti industri pionir atau substitusi impor" },
-    { stateKey: "fileMesinDnBmp", contextKey: "mesin_peralatan", widthMm: 70, shape: "std", noDataLabel: "bukti penggunaan mesin & peralatan produksi dalam negeri" },
-    { stateKey: "fileLokasiBmp", contextKey: "lokasi_produksi", widthMm: 70, shape: "std", noDataLabel: "bukti lokasi pembuatan" },
-    { stateKey: "fileI40Bmp", contextKey: "industri_4_0", widthMm: 70, shape: "std", noDataLabel: "bukti penerapan Industri 4.0" },
-    { stateKey: "fileSdmBmp", contextKey: "pengembangan_SDM", widthMm: 70, shape: "std", noDataLabel: "bukti pengembangan sumber daya manusia industri" },
-    { stateKey: "fileSertifikatBmp", contextKey: "sertifikat_akreditasi", widthMm: 70, shape: "std", noDataLabel: "bukti kepemilikan sertifikat/akreditasi" },
-    { stateKey: "fileHijauBmp", contextKey: "industri_hijau", widthMm: 70, shape: "std", noDataLabel: "bukti penerapan industri hijau" },
-    { stateKey: "fileEksporBmp", contextKey: "nilai_ekspor", widthMm: 70, shape: "std", noDataLabel: "bukti nilai ekspor" },
-    { stateKey: "fileMerekDnBmp", contextKey: "produk_dalam_negeri", widthMm: 70, shape: "std", noDataLabel: "bukti kepemilikan produk/merek dalam negeri" },
-    { stateKey: "fileEsgBmp", contextKey: "penerapan_esg", widthMm: 70, shape: "std", noDataLabel: "bukti penerapan ESG (Environmental Social Governance)" },
-    { stateKey: "fileAwardsBmp", contextKey: "penghargaan_awards", widthMm: 70, shape: "std", noDataLabel: "bukti penghargaan/awards" },
-    { stateKey: "fileSiinasBmp", contextKey: "pelaporan_siinas", widthMm: 70, shape: "std", noDataLabel: "bukti kepatuhan pelaporan data industri pada SIINas" },
-
-    { stateKey: "fileDokumenPengembangan", contextKey: "dokumen_pengembangan", widthMm: 70, shape: "std", noDataLabel: "dokumen pengembangan" },
-    { stateKey: "fileAktaPendirian", contextKey: "akta_pendirian_terakhir", widthMm: 70, shape: "std", noDataLabel: "akta pendirian/perubahan terakhir" },
-    { stateKey: "fileNibRba", contextKey: "nib_rba", widthMm: 70, shape: "std", noDataLabel: "NIB RBA" },
-    { stateKey: "fileSertifikatStandar", contextKey: "sert_standar", widthMm: 70, shape: "std", noDataLabel: "sertifikat standar" },
-    { stateKey: "fileIzinUsaha", contextKey: "izin_usaha", widthMm: 70, shape: "std", noDataLabel: "surat izin operasional / izin" },
-    { stateKey: "fileNpwpLampiran", contextKey: "npwp_lampiran", widthMm: 70, shape: "std", noDataLabel: "NPWP perusahaan" },
-    { stateKey: "fileSertifikatMerek", contextKey: "sert_merek", widthMm: 70, shape: "std", noDataLabel: "sertifikat merek" },
-    { stateKey: "fileSertifikatProduk", contextKey: "sert_produk", widthMm: 70, shape: "std", noDataLabel: "sertifikat produk" },
-    { stateKey: "fileNie", contextKey: "nie", widthMm: 70, shape: "std", noDataLabel: "NIE" },
-    { stateKey: "fileBpom", contextKey: "bpom", widthMm: 70, shape: "std", noDataLabel: "BPOM" },
-    { stateKey: "fileFotoProduk", contextKey: "foto_produk", widthMm: 70, shape: "std", noDataLabel: "foto produk akhir" },
-    { stateKey: "fileFotoBahanBaku", contextKey: "foto_bahan_baku", widthMm: 70, shape: "std", noDataLabel: "foto bahan baku" },
-    { stateKey: "fileInvoiceBahanBaku", contextKey: "invoice_bahan_baku", widthMm: 70, shape: "std", noDataLabel: "invoice pembelian bahan baku" },
-    { stateKey: "fileAlurProsesLampiran", contextKey: "alur_proses_lampiran", widthMm: 70, shape: "std", noDataLabel: "alur proses produksi pabrik" },
-    { stateKey: "fileDaftarGaji", contextKey: "daftar_gaji", widthMm: 70, shape: "std", noDataLabel: "daftar gaji tenaga kerja dan kewarganegaraan" },
-    { stateKey: "fileSampelKtp", contextKey: "sampel_ktp", widthMm: 70, shape: "std", noDataLabel: "sampel dokumen identitas tenaga kerja (KTP)" },
-    { stateKey: "fileStrukturPabrik", contextKey: "struktur_pabrik", widthMm: 70, shape: "std", noDataLabel: "struktur organisasi pabrik" },
-    { stateKey: "fileFotoMesin", contextKey: "foto_mesin", widthMm: 70, shape: "std", noDataLabel: "foto alat kerja / mesin peralatan produksi" },
-    { stateKey: "fileDaftarPenyusutan", contextKey: "daftar_penyusutan", widthMm: 70, shape: "std", noDataLabel: "daftar penyusutan alat mesin" },
-    { stateKey: "fileBuktiListrik", contextKey: "bukti_listrik", widthMm: 70, shape: "std", noDataLabel: "bukti pembayaran token/listrik" },
-    { stateKey: "fileAktaSewa", contextKey: "akta_sewa", widthMm: 70, shape: "std", noDataLabel: "akta sewa/kepemilikan tempat" },
-    { stateKey: "fileGeotagging", contextKey: "geotagging", widthMm: 70, shape: "std", noDataLabel: "foto kunjungan on-site (geotagging)" },
-  ];
-
-  const SINGLE_IMAGE_CONFIG = [
-    { stateKey: "fileCover", contextKey: "cover_laporan", widthMm: null },
-    { stateKey: "fileLogo", contextKey: "logo_perusahaan", widthMm: 20 },
-    { stateKey: "fileTtdVerifikator", contextKey: "ttd_verifikator", widthMm: 20 },
-    { stateKey: "fileStruktur", contextKey: "struktur_organisasi", widthMm: 70 },
-    { stateKey: "fileAlurProduksi", contextKey: "alur_produksi", widthMm: 70 },
-    { stateKey: "fileStrukturIndustri", contextKey: "struktur_organisasi_perusahaan_industri", widthMm: 70 },
-    // foto_barang: dipakai template TKDN di blok "Rincian Barang" (Ringkasan Eksekutif) sebagai 1 foto tunggal
-    { stateKey: "fileFotoBarang", contextKey: "foto_barang", widthMm: 70 },
-  ];
-
-  // --------------------------------------------------------------------
-  // Hitung total "unit pekerjaan" (file/gambar) yang akan diproses --
-  // dipakai sebagai penyebut untuk progress bar (persentase generate LHV).
-  // --------------------------------------------------------------------
-  function countFileItems(state) {
-    let n = 0;
-    for (const cfg of SINGLE_IMAGE_CONFIG) {
-      if (state[cfg.stateKey]) n += 1;
-    }
-    for (const cfg of CATEGORY_CONFIG) {
-      const list = state[cfg.stateKey] || [];
-      n += list.filter((item) => item && item.file).length;
-    }
-    if (state.modeRekapBahanBaku === "upload" && state.fileRekapBahanBaku) n += 1;
-    return n;
+  // Pastikan PDF.js worker diset ke CDN yang sama dengan index.html
+  if (global.pdfjsLib && !global.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+    global.pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   }
 
-  // --------------------------------------------------------------------
-  // Input <input type="number"> di HTML SELALU memakai titik (.) sebagai
-  // pemisah desimal -- ini standar HTML5 dan tidak mengikuti bahasa/lokasi
-  // perangkat. Fungsi ini mengubahnya jadi format Indonesia (koma) supaya
-  // yang tampil di dokumen Word konsisten dengan cara penulisan
-  // Indonesia, mis. "53.33" -> "53,33".
-  // --------------------------------------------------------------------
-  function toIndoDecimal(val) {
-    if (val === null || val === undefined) return val;
-    return String(val).trim().replace(".", ",");
+  // =========================================================================
+  // 1. NOMOR LHV OTOMATIS & FORMAT TANGGAL INDONESIA
+  // =========================================================================
+  const BULAN_ID = [
+    "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+    "Juli", "Agustus", "September", "Oktober", "November", "Desember"
+  ];
+  const ROMAWI = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
+
+  function formatTanggalIndo(dateStr) {
+    if (!dateStr) return "";
+    const parts = String(dateStr).split("-");
+    if (parts.length !== 3) return dateStr;
+    const [y, m, d] = parts;
+    const bln = BULAN_ID[parseInt(m, 10)] || m;
+    return `${parseInt(d, 10)} ${bln} ${y}`;
   }
 
+  function buatInisial(nama) {
+    if (!nama || !String(nama).trim()) return "";
+    return String(nama)
+      .trim()
+      .split(/\s+/)
+      .map((w) => w[0].toUpperCase())
+      .join("");
+  }
+
+  function kodeSkemaNomor(jenisLhv) {
+    if (jenisLhv === "Kerjasama") return "TKDN-K";
+    if (jenisLhv === "BMP") return "BMP";
+    if (jenisLhv === "Jasa") return "TKDN-J";
+    if (jenisLhv === "Gabungan") return "TKDN-G";
+    return "TKDN";
+  }
+
+  function buildNoLhv(state) {
+    const tgl = state.tanggalLhv || "";
+    const parts = tgl.split("-");
+    const tahun = parts[0] || String(new Date().getFullYear());
+    const bulanNum = parseInt(parts[1], 10) || (new Date().getMonth() + 1);
+    const romawi = ROMAWI[bulanNum] || "I";
+    const kode = kodeSkemaNomor(state.jenisLhv);
+    const id = (state.idBerkas || "").trim() || "00000";
+    const inisial = buatInisial(state.namaVerifikator);
+    return `${id}/LVI-BBSPJPPI/${kode}/${romawi}/${tahun}${inisial ? "/" + inisial : ""}`;
+  }
+
+  // =========================================================================
+  // 2. PEMROSESAN GAMBAR & PDF (AUTO-TRIM + PROPORTIONAL SCALING)
+  // =========================================================================
   let tokenCounter = 0;
-  function nextToken(key) {
+  function nextToken(prefix) {
     tokenCounter += 1;
-    return `§§IMG:${key}:${tokenCounter}§§`;
+    return `§§IMG:${prefix}_${tokenCounter}§§`;
   }
 
-  // --------------------------------------------------------------------
-  // Ekstraksi gambar dari PDF: setiap halaman dirender jadi 1 gambar PNG
-  // (pendekatan yang stabil untuk berjalan di browser)
-  // --------------------------------------------------------------------
-  async function extractPdfPagesAsBlobs(file) {
+  // Pangkas margin putih/kosong di sekeliling kanvas agar mengikuti pola isi dokumen.
+  // Pada mode formulir: abaikan 3% garis bingkai luar & 6% footer bawah ("Halaman X dari"),
+  // serta berhenti saat menjumpai celah kosong vertikal lebar setelah tabel utama.
+  function trimCanvasWhitespace(sourceCanvas, isFormulir = false, padding = 16) {
+    const ctx = sourceCanvas.getContext("2d");
+    const { width, height } = sourceCanvas;
+    const data = ctx.getImageData(0, 0, width, height).data;
+
+    const mX = isFormulir ? Math.round(width * 0.03) : 4;
+    const mTop = isFormulir ? Math.round(height * 0.03) : 4;
+    const mBot = isFormulir ? Math.round(height * 0.94) : height - 4;
+
+    const rowInk = new Array(height).fill(0);
+    let minX = width, maxX = 0, hasContent = false;
+
+    for (let y = mTop; y < mBot; y++) {
+      let count = 0;
+      for (let x = mX; x < width - mX; x++) {
+        const i = (y * width + x) * 4;
+        if (data[i + 3] > 10 && (data[i] < 240 || data[i + 1] < 240 || data[i + 2] < 240)) {
+          count++;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          hasContent = true;
+        }
+      }
+      rowInk[y] = count;
+    }
+
+    if (!hasContent) return sourceCanvas;
+
+    let minY = mTop;
+    while (minY < mBot && rowInk[minY] < 3) minY++;
+
+    let maxY = minY;
+    if (isFormulir) {
+      let emptyRun = 0;
+      const gapThreshold = Math.round(height * 0.055);
+      for (let y = minY; y < mBot; y++) {
+        if (rowInk[y] >= 3) {
+          maxY = y;
+          emptyRun = 0;
+        } else {
+          emptyRun++;
+          if (emptyRun >= gapThreshold && maxY > minY + 100) break;
+        }
+      }
+    } else {
+      for (let y = mBot - 1; y >= minY; y--) {
+        if (rowInk[y] >= 3) { maxY = y; break; }
+      }
+    }
+
+    minX = Math.max(0, minX - padding);
+    minY = Math.max(0, minY - padding);
+    maxX = Math.min(width, maxX + padding);
+    maxY = Math.min(height, maxY + padding);
+
+    const w = maxX - minX;
+    const h = maxY - minY;
+    const trimmed = document.createElement("canvas");
+    trimmed.width = w;
+    trimmed.height = h;
+    trimmed.getContext("2d").drawImage(sourceCanvas, minX, minY, w, h, 0, 0, w, h);
+    return trimmed;
+  }
+
+  async function extractPdfPagesAsBlobs(file, isFormulir = false) {
     const buf = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
     const blobs = [];
@@ -158,23 +147,16 @@
       canvas.height = viewport.height;
       const ctx = canvas.getContext("2d");
       await page.render({ canvasContext: ctx, viewport }).promise;
-      const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+
+      const cleanCanvas = trimCanvasWhitespace(canvas, isFormulir, 16);
+      const blob = await new Promise((res) => cleanCanvas.toBlob(res, "image/png"));
       blobs.push(blob);
     }
     return blobs;
   }
 
-  // --------------------------------------------------------------------
-  // Menyeragamkan ukuran gambar sebelum disisipkan ke Word, supaya hasil
-  // rapi & sejajar (grid 2 kolom sering terlihat "berantakan" kalau tiap
-  // foto punya rasio & tinggi yang beda-beda). Pakai teknik "contain-fit
-  // proporsional": gambar diskalakan utuh (TIDAK dipotong/tidak ada isi
-  // yang hilang) supaya muat pas di kotak berukuran seragam, sisa ruang
-  // kosong diisi latar putih. Hasilnya semua foto dalam 1 kategori punya
-  // ukuran kotak yang SAMA PERSIS & tetap proporsional, tanpa risiko
-  // konten penting (mis. tulisan di pinggir KTP/sertifikat) ikut terpotong.
-  // --------------------------------------------------------------------
-  async function normalizeImageToBox(blob, boxPx) {
+  // Perkecil resolusi secara proporsional TANPA kotak persegi 1:1 (tanpa ruang kosong putih di kiri-kanan)
+  async function normalizeImageProportional(blob, maxSidePx = 1200) {
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
@@ -188,21 +170,14 @@
       im.src = dataUrl;
     });
 
-    const canvas = document.createElement("canvas");
-    canvas.width = boxPx;
-    canvas.height = boxPx;
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, boxPx, boxPx);
+    const scale = Math.min(1, maxSidePx / Math.max(img.width, img.height));
+    const targetW = Math.round(img.width * scale);
+    const targetH = Math.round(img.height * scale);
 
-    // proporsional: skala pakai sisi TERPANJANG supaya seluruh gambar
-    // muat utuh di dalam kotak (tidak ada yang terpotong)
-    const scale = Math.min(boxPx / img.width, boxPx / img.height);
-    const dw = img.width * scale;
-    const dh = img.height * scale;
-    const dx = (boxPx - dw) / 2;
-    const dy = (boxPx - dh) / 2;
-    ctx.drawImage(img, dx, dy, dw, dh);
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    canvas.getContext("2d").drawImage(img, 0, 0, targetW, targetH);
 
     return new Promise((resolve) => {
       canvas.toBlob((b) => resolve(b || blob), "image/png");
@@ -210,30 +185,64 @@
   }
 
   function isExcelFile(file) {
+    if (!file) return false;
     const name = (file.name || "").toLowerCase();
     return (
-      file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
-      file.type === "application/vnd.ms-excel" ||
       name.endsWith(".xlsx") ||
-      name.endsWith(".xls")
+      name.endsWith(".xls") ||
+      file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+      file.type === "application/vnd.ms-excel"
     );
   }
 
-  // --------------------------------------------------------------------
-  // Bangun { contextList, imageJobs } dari satu daftar dinamis (state list)
-  // --------------------------------------------------------------------
+  async function processSingleImage(fileOrBlob, customBlobs, widthMm, imageJobs, label, tick) {
+    const source = (Array.isArray(customBlobs) && customBlobs[0]) || fileOrBlob;
+    if (!source) return "";
+    tick && tick(`Memproses gambar: ${label}...`);
+    let blob = source;
+    if (source.type === "application/pdf") {
+      const pages = await extractPdfPagesAsBlobs(source, false);
+      if (pages.length === 0) return "";
+      blob = pages[0];
+    }
+    const token = nextToken(label);
+    imageJobs.set(token, { blob, widthMm });
+    return token;
+  }
+
   async function buildDynamicList(list, widthMm, shape, imageJobs, tick) {
     const result = [];
     for (const item of list || []) {
-      if (!item.file) continue;
+      const hasCustom = Array.isArray(item.customBlobs) && item.customBlobs.length > 0;
+      if (!item.file && !hasCustom) continue;
       const keterangan = shape === "formulir" ? item.judul || "" : item.keterangan || "";
 
+      // Prioritas 1: Hasil crop manual dari modal pratinjau
+      if (hasCustom) {
+        tick && tick(`Memuat potongan manual: ${item.file?.name || keterangan}...`);
+        for (let idx = 0; idx < item.customBlobs.length; idx++) {
+          let blob = item.customBlobs[idx];
+          if (shape === "std") blob = await normalizeImageProportional(blob, 1200);
+          const token = nextToken("dyn");
+          imageJobs.set(token, { blob, widthMm });
+          const caption =
+            item.customBlobs.length > 1
+              ? keterangan
+                ? `${keterangan} (Halaman ${idx + 1})`
+                : `Halaman ${idx + 1}`
+              : keterangan;
+          result.push({ judul: caption, keterangan: caption, gambar: token });
+        }
+        continue;
+      }
+
+      // Prioritas 2: Ekstraksi & auto-trim otomatis
       if (item.file.type === "application/pdf") {
         tick && tick(`Mengekstrak halaman PDF: ${item.file.name}...`);
-        const pages = await extractPdfPagesAsBlobs(item.file);
+        const pages = await extractPdfPagesAsBlobs(item.file, shape === "formulir");
         for (let idx = 0; idx < pages.length; idx++) {
           let blob = pages[idx];
-          if (shape === "std") blob = await normalizeImageToBox(blob, 900);
+          if (shape === "std") blob = await normalizeImageProportional(blob, 1200);
           const token = nextToken("dyn");
           imageJobs.set(token, { blob, widthMm });
           const caption = keterangan ? `${keterangan} (Halaman ${idx + 1})` : `Halaman ${idx + 1}`;
@@ -242,16 +251,14 @@
       } else if (isExcelFile(item.file)) {
         tick && tick(`Menggambar tabel dari Excel: ${item.file.name}...`);
         let blob = await ExcelRender.renderExcelToImage(item.file);
-        if (shape === "std") blob = await normalizeImageToBox(blob, 900);
+        if (shape === "std") blob = await normalizeImageProportional(blob, 1200);
         const token = nextToken("dyn");
         imageJobs.set(token, { blob, widthMm });
         result.push({ judul: keterangan, keterangan: keterangan, gambar: token });
       } else {
         let blob = item.file;
         tick && tick(`Memproses berkas: ${item.file.name || keterangan}...`);
-        if (shape === "std") {
-          blob = await normalizeImageToBox(blob, 900);
-        }
+        if (shape === "std") blob = await normalizeImageProportional(blob, 1200);
         const token = nextToken("dyn");
         imageJobs.set(token, { blob, widthMm });
         result.push({ judul: keterangan, keterangan: keterangan, gambar: token });
@@ -260,366 +267,306 @@
     return result;
   }
 
-  // --------------------------------------------------------------------
-  // Bangun seluruh context + imageJobs + tableJobs dari state form React
-  // --------------------------------------------------------------------
-  async function buildContext(state, onProgress, tick) {
-    const context = {};
-    const imageJobs = new Map();
-    const tableJobs = new Map();
-
-    // --- Field teks biasa (persis nama kolom di models.py lama) ---
-    const textFields = {
-      jenis_lhv: state.jenisLhv,
-      nama_perusahaan: state.namaPerusahaan,
-      // "tanggal_dibuat" dipakai template di baris tanda tangan ("Semarang, {{ tanggal_dibuat }}")
-      // -- ini harus tanggal TERBIT LAPORAN (tanggalLhv), BUKAN tanggal pelaksanaan verifikasi.
-      tanggal_dibuat: DocxEngine.formatTanggalIndo(state.tanggalLhv),
-      tanggal_lhv: DocxEngine.formatTanggalIndo(state.tanggalLhv),
-      id_berkas: state.idBerkas,
-      permenperin: state.permenperin,
-      skala_perusahaan: state.skalaPerusahaan,
-      no_izin: state.noIzin,
-
-      nama_perusahaan_industri: state.namaPerusahaanIndustri,
-      alamat_perusahaan_industri: state.alamatPerusahaanIndustri,
-      skala_perusahaan_industri: state.skalaPerusahaanIndustri,
-      no_izin_perusahaan_industri: state.noIzinPerusahaanIndustri,
-      telepon_kantor_industri: state.teleponKantorIndustri,
-      fax_kantor_industri: state.faxKantorIndustri,
-      email_kantor_industri: state.emailKantorIndustri,
-      website_kantor_industri: state.websiteKantorIndustri,
-      status_kantor_industri: state.statusKantorIndustri,
-      pic_kantor_industri: state.picKantorIndustri,
-      akta_kantor_industri: state.aktaKantorIndustri,
-      npwp_kantor_industri: state.npwpKantorIndustri,
-
-      nilai_bmp: toIndoDecimal(state.nilaiBmp),
-      terbilang_bmp: state.terbilangBmp,
-
-      tgl_verifikasi_dok: DocxEngine.formatTanggalIndo(state.tglVerifikasiDok),
-      tgl_verifikasi_lapangan: DocxEngine.formatTanggalIndo(state.tglVerifikasiLapangan),
-      kbli: state.kbli,
-      kapasitas_produksi: state.kapasitasProduksi,
-      jenis_barang: state.jenisBarang,
-      tipe_barang: state.tipeBarang,
-      spesifikasi_barang: state.spesifikasiBarang,
-      kode_hs: state.kodeHs,
-      merek_barang: state.merekBarang,
-      kelompok_barang: state.kelompokBarang,
-      nilai_tkdn: toIndoDecimal(state.nilaiTkdn),
-      terbilang_tkdn: state.terbilangTkdn,
-      // Kalau Brainware tidak diisi, tampilkan "-" di dokumen (bukan kosong/blank)
-      nilai_brainware: state.nilaiBrainware ? toIndoDecimal(state.nilaiBrainware) : "-",
-      terbilang_brainware: state.nilaiBrainware ? state.terbilangBrainware : "",
-      brainware_diisi: !!state.nilaiBrainware,
-      nama_verifikator: state.namaVerifikator,
-      nip_verifikator: state.nipVerifikator,
-      pejabat_mengetahui: state.pejabatMengetahui,
-      nama_pejabat: state.namaPejabat,
-      nip_pejabat: state.nipPejabat,
-
-      alamat_kantor: state.alamatKantor,
-      telepon_kantor: state.teleponKantor,
-      fax_kantor: state.faxKantor,
-      email_kantor: state.emailKantor,
-      website_kantor: state.websiteKantor,
-      status_kantor: state.statusKantor,
-      pic_kantor: state.picKantor,
-      akta_kantor: state.aktaKantor,
-      npwp_kantor: state.npwpKantor,
-
-      alamat_pabrik: state.alamatPabrik,
-      telepon_pabrik: state.teleponPabrik,
-      fax_pabrik: state.faxPabrik,
-      email_pabrik: state.emailPabrik,
-      website_pabrik: state.websitePabrik,
-      status_pabrik: state.statusPabrik,
-      pic_pabrik: state.picPabrik,
-      akta_pabrik: state.aktaPabrik,
-      npwp_pabrik: state.npwpPabrik,
-    };
-    for (const k in textFields) context[k] = textFields[k] == null ? "" : textFields[k];
-
-    // --- Acuan peraturan & aspek BMP ---
-    context.daftar_acuan_peraturan = (state.acuanPeraturan || [])
-      .filter((a) => {
-        if (a.id === 6 && !(state.permenperin || "").includes("35 Tahun 2025")) return false;
-        return true;
-      })
-      .map((a) => ({ aturan: (a.aturan || "").replace(/[\r\n]+/g, " ").trim() }));
-
-    context.aspek_bmp = (state.aspekBmp || []).filter((a) => a.checked).map((a) => a.teks);
-
-    // --- Rekapitulasi Bahan Baku: tabel dinamis, ATAU upload dokumen (PDF/gambar) ---
-    // Dipakai OLEH DUA MEKANISME BERBEDA di template yang berbeda:
-    //   - tabel_dinamis_bahan_baku : placeholder TUNGGAL (Kerjasama) -- diganti
-    //     jadi <w:tbl> asli, atau gambar utuh kalau mode upload.
-    //   - rekap_bahan_baku          : FOR-LOOP tabel biasa (TKDN & BMP) --
-    //     iterasi array {nama_bahan, produsen, asal} baris per baris.
-    if (state.modeRekapBahanBaku === "upload" && state.fileRekapBahanBaku) {
-      tick ? tick("Memproses dokumen rekapitulasi bahan baku...") : onProgress && onProgress("Memproses dokumen rekapitulasi bahan baku...");
-      let pages;
-      if (state.fileRekapBahanBaku.type === "application/pdf") {
-        pages = await extractPdfPagesAsBlobs(state.fileRekapBahanBaku);
-        if (pages.length === 0) pages = [state.fileRekapBahanBaku];
-      } else {
-        pages = [state.fileRekapBahanBaku];
+  function groupIntoRows(list, perBaris) {
+    const out = [];
+    if (perBaris === 1) {
+      for (let i = 0; i < list.length; i++) {
+        out.push({
+          gambar_1: list[i].gambar,
+          keterangan_1: list[i].keterangan || "",
+          gambar_2: "",
+          keterangan_2: "",
+        });
       }
-
-      // tabel_dinamis_bahan_baku (Kerjasama): cuma bisa menampung 1 gambar
-      // di slotnya (placeholder tunggal, bukan loop) -- pakai halaman pertama.
-      const imgTokenTunggal = nextToken("rekapbaku_img");
-      imageJobs.set(imgTokenTunggal, { blob: pages[0], widthMm: 160 });
-      context.tabel_dinamis_bahan_baku = imgTokenTunggal;
-      if (pages.length > 1) {
-        console.warn(
-          `Rekapitulasi Bahan Baku: PDF punya ${pages.length} halaman -- slot tabel_dinamis_bahan_baku (Kerjasama) cuma menampilkan halaman pertama, tapi rekap_bahan_baku (TKDN/BMP) menampilkan SEMUA halaman sebagai baris terpisah.`
-        );
-      }
-
-      // rekap_bahan_baku (TKDN/BMP): FOR-LOOP, jadi SEMUA halaman bisa
-      // ditampilkan -- 1 halaman = 1 baris, gambar disisipkan di kolom
-      // "Bahan Baku".
-      context.rekap_bahan_baku = pages.map((blob, i) => {
-        const token = nextToken("rekapbaku_row" + i);
-        imageJobs.set(token, { blob, widthMm: 60 });
-        return { nama_bahan: token, produsen: "(dokumen upload)", asal: "" };
+      return out;
+    }
+    for (let i = 0; i < list.length; i += 2) {
+      const a = list[i];
+      const b = list[i + 1];
+      out.push({
+        gambar_1: a.gambar,
+        keterangan_1: a.keterangan || "",
+        gambar_2: b ? b.gambar : "",
+        keterangan_2: b ? b.keterangan || "" : "",
       });
-    } else {
-      const tableToken = "§§TABLE:bahanbaku§§";
-      context.tabel_dinamis_bahan_baku = tableToken;
-      tableJobs.set(tableToken, { rows: state.rekapBahanBaku || [] });
-
-      context.rekap_bahan_baku = (state.rekapBahanBaku || [])
-        .filter((r) => (r.nama_bahan || "").trim() !== "")
-        .map((r) => ({
-          nama_bahan: r.nama_bahan || "",
-          produsen: r.produsen || "",
-          asal: r.asal || "DN",
-        }));
     }
+    return out;
+  }
 
-    // --- Gambar tunggal ---
-    for (const cfg of SINGLE_IMAGE_CONFIG) {
-      const file = state[cfg.stateKey];
-      if (file) {
-        let blob = file;
-        if (file.type === "application/pdf") {
-          tick && tick(`Mengekstrak halaman PDF: ${file.name}...`);
-          const pages = await extractPdfPagesAsBlobs(file);
-          blob = pages[0] || file;
-          if (pages.length > 1) {
-            console.warn(`${cfg.contextKey}: PDF punya ${pages.length} halaman, hanya halaman pertama yang dipakai (slot ini cuma menampung 1 gambar).`);
-          }
-        } else {
-          tick && tick(`Memproses gambar: ${file.name || cfg.contextKey}...`);
-        }
-        const token = nextToken(cfg.contextKey);
-        imageJobs.set(token, { blob, widthMm: cfg.widthMm });
-        context[cfg.contextKey] = token;
-      } else {
-        context[cfg.contextKey] = "";
-      }
-    }
+  // =========================================================================
+  // 3. KATEGORI DOKUMEN DINAMIS
+  // =========================================================================
+  const CATEGORY_CONFIG = [
+    ["formulirVerifikasi", "list_formulir", 165, "formulir", false],
+    ["fileBuktiPabrik", "list_bukti_pabrik", 70, "std", true],
+    ["fileBom", "list_bom", 70, "std", true],
+    ["fileSertifikatTkdn", "list_sertifikat_tkdn", 70, "std", true],
+    ["fileBuktiBeli", "list_bukti_beli", 70, "std", true],
+    ["fileKtp", "list_ktp", 70, "std", true],
+    ["fileBuktiKerjasama", "list_bukti_kerjasama", 70, "std", true],
+    ["fileTenagaKerjaBmp", "list_tenaga_kerja_bmp", 70, "std", true],
+    ["fileInvestasiBmp", "list_investasi_bmp", 70, "std", true],
+    ["fileKemitraanBmp", "list_kemitraan_bmp", 70, "std", true],
+    ["fileSubstitusiBmp", "list_substitusi_bmp", 70, "std", true],
+    ["fileMesinDnBmp", "list_mesin_dn_bmp", 70, "std", true],
+    ["fileLokasiBmp", "list_lokasi_bmp", 70, "std", true],
+    ["fileI40Bmp", "list_i40_bmp", 70, "std", true],
+    ["fileSdmBmp", "list_sdm_bmp", 70, "std", true],
+    ["fileSertifikatBmp", "list_sertifikat_bmp", 70, "std", true],
+    ["fileHijauBmp", "list_hijau_bmp", 70, "std", true],
+    ["fileEksporBmp", "list_ekspor_bmp", 70, "std", true],
+    ["fileMerekDnBmp", "list_merek_dn_bmp", 70, "std", true],
+    ["fileEsgBmp", "list_esg_bmp", 70, "std", true],
+    ["fileAwardsBmp", "list_awards_bmp", 70, "std", true],
+    ["fileSiinasBmp", "list_siinas_bmp", 70, "std", true],
+    ["fileDokumenPengembangan", "list_dokumen_pengembangan", 70, "std", true],
+    ["fileAktaPendirian", "list_akta_pendirian", 70, "std", true],
+    ["fileNibRba", "list_nib_rba", 70, "std", true],
+    ["fileSertifikatStandar", "list_sertifikat_standar", 70, "std", true],
+    ["fileIzinUsaha", "list_izin_usaha", 70, "std", true],
+    ["fileNpwpLampiran", "list_npwp_lampiran", 70, "std", true],
+    ["fileSertifikatMerek", "list_sert_merek", 70, "std", true],
+    ["fileSertifikatProduk", "list_sert_produk", 70, "std", true],
+    ["fileNie", "list_nie", 70, "std", true],
+    ["fileBpom", "list_bpom", 70, "std", true],
+    ["fileFotoProduk", "list_foto_produk", 70, "std", true],
+    ["fileFotoBahanBaku", "list_foto_bahan_baku", 70, "std", true],
+    ["fileInvoiceBahanBaku", "list_invoice_bahan_baku", 70, "std", true],
+    ["fileAlurProsesLampiran", "list_alur_proses_lampiran", 70, "std", true],
+    ["fileDaftarGaji", "list_daftar_gaji", 70, "std", true],
+    ["fileSampelKtp", "list_sampel_ktp", 70, "std", true],
+    ["fileStrukturPabrik", "list_struktur_pabrik", 70, "std", true],
+    ["fileFotoMesin", "list_foto_mesin", 70, "std", true],
+    ["fileDaftarPenyusutan", "list_daftar_penyusutan", 70, "std", true],
+    ["fileBuktiListrik", "list_bukti_listrik", 70, "std", true],
+    ["fileAktaSewa", "list_akta_sewa", 70, "std", true],
+    ["fileGeotagging", "list_geotagging", 70, "std", true],
+  ];
 
-    // --- Gambar dinamis (list) ---
-    // Tata letak galeri foto: 1 gambar besar per baris, 2 (bawaan template),
-    // atau 4 gambar kecil per baris supaya lebih banyak muat per halaman.
-    // "batchOverride" menimpa angka batch(2,...) yang di-hardcode di
-    // template (lihat docx-engine.js); lebar gambar disesuaikan supaya
-    // tetap pas di dalam sel tabel (lebar sel asli template ±82mm).
-    const LAYOUT_MAP = {
-      "1": { batchOverride: 1, widthMm: 78 },
-      "2": { batchOverride: 2, widthMm: 70 },
-      "4": { batchOverride: 2, widthMm: 38 },
+  const TEMPLATE_MAP = {
+    "Produksi Sendiri": "templates/template_lhv_produksi_sendiri.docx",
+    "Kerjasama": "templates/template_lhv_kerjasama.docx",
+    "BMP": "templates/template_lhv_bmp.docx",
+    "Jasa": "templates/template_lhv_jasa.docx",
+    "Gabungan": "templates/template_lhv_gabungan.docx",
+  };
+
+  // =========================================================================
+  // 4. GENERATOR UTAMA
+  // =========================================================================
+  async function generateAndDownload(state, onProgress) {
+    tokenCounter = 0;
+    const imageJobs = new Map();
+
+    const layoutChoice = String(state.layoutGambar || "2");
+    const stdWidthMm = layoutChoice === "1" ? 130 : layoutChoice === "4" ? 45 : 70;
+    const perBaris = layoutChoice === "1" ? 1 : 2;
+
+    const activeCats = CATEGORY_CONFIG.filter(([key]) =>
+      (state[key] || []).some((it) => it && (it.file || (it.customBlobs && it.customBlobs.length > 0)))
+    );
+    const totalSteps = 1 + activeCats.length + 3 + 1;
+    let doneSteps = 0;
+    const step = (msg) => {
+      doneSteps += 1;
+      const pct = Math.min(99, Math.round((doneSteps / totalSteps) * 100));
+      onProgress && onProgress(msg, pct);
     };
-    const layoutCfg = LAYOUT_MAP[state.layoutGambar] || LAYOUT_MAP["2"];
-    context.__batchOverride = layoutCfg.batchOverride;
 
-    for (const cfg of CATEGORY_CONFIG) {
-      onProgress && onProgress(`Memproses berkas: ${cfg.contextKey}...`);
-      const widthUntukKategoriIni = cfg.shape === "std" ? layoutCfg.widthMm : cfg.widthMm;
-      let daftar = await buildDynamicList(
-        state[cfg.stateKey],
-        widthUntukKategoriIni,
-        cfg.shape,
+    const tick = (msg) => {
+      const pct = Math.min(99, Math.round((doneSteps / totalSteps) * 100));
+      onProgress && onProgress(msg, pct);
+    };
+
+    const jenisLhv = state.jenisLhv || "Produksi Sendiri";
+    const templateUrl = TEMPLATE_MAP[jenisLhv] || TEMPLATE_MAP["Produksi Sendiri"];
+    const tplResp = await fetch(templateUrl);
+    if (!tplResp.ok) {
+      throw new Error(`Template tidak ditemukan (${templateUrl} -> HTTP ${tplResp.status})`);
+    }
+    const templateBuffer = await tplResp.arrayBuffer();
+    step(`Memuat template ${jenisLhv}...`);
+
+    const logoToken = await processSingleImage(state.fileLogo, null, 20, imageJobs, "logo", tick);
+    const ttdToken = await processSingleImage(state.fileTtdVerifikator, null, 20, imageJobs, "ttd", tick);
+    const strukturToken = await processSingleImage(
+      state.fileStruktur, state.customBlobsStruktur, 70, imageJobs, "struktur", tick
+    );
+    const alurToken = await processSingleImage(
+      state.fileAlurProduksi, state.customBlobsAlurProduksi, 70, imageJobs, "alur", tick
+    );
+    const strukturIndustriToken = await processSingleImage(
+      state.fileStrukturIndustri, state.customBlobsStrukturIndustri, 70, imageJobs, "struktur_ind", tick
+    );
+    const coverToken = await processSingleImage(state.fileCover, null, 210, imageJobs, "cover", tick);
+    const fotoBarangToken = await processSingleImage(state.fileFotoBarang, null, 70, imageJobs, "foto_barang", tick);
+    const fotoProdukUtamaToken = await processSingleImage(state.fileFotoProdukUtama, null, 70, imageJobs, "foto_produk_utama", tick);
+    step("Memproses cover, logo & gambar utama...");
+
+    const dynamicContext = {};
+    for (const [stateKey, tplKey, widthMm, shape, groupTwo] of CATEGORY_CONFIG) {
+      const list = state[stateKey] || [];
+      const hasFile = list.some((it) => it && (it.file || (it.customBlobs && it.customBlobs.length > 0)));
+      const effectiveWidth = shape === "std" ? stdWidthMm : widthMm;
+      const built = await buildDynamicList(list, effectiveWidth, shape, imageJobs, tick);
+      dynamicContext[tplKey] = groupTwo ? groupIntoRows(built, perBaris) : built;
+      if (hasFile) step(`Memproses ${tplKey}...`);
+    }
+
+    const acuanFiltered = (state.acuanPeraturan || [])
+      .filter((item) => {
+        if (item.id === 6 && !(state.permenperin || "").includes("35 Tahun 2025")) return false;
+        return Boolean(item.aturan && item.aturan.trim());
+      })
+      .map((item) => item.aturan.trim());
+
+    const aspekChecked = (state.aspekBmp || [])
+      .filter((a) => a.checked)
+      .map((a) => a.teks);
+
+    const rekapClean = (state.rekapBahanBaku || [])
+      .filter((r) => (r.nama_bahan && r.nama_bahan.trim()) || (r.produsen && r.produsen.trim()))
+      .map((r, i) => ({
+        no: i + 1,
+        nama_bahan: r.nama_bahan || "",
+        produsen: r.produsen || "",
+        asal: r.asal || "DN",
+      }));
+
+    let rekapToken = "";
+    if (state.modeRekapBahanBaku === "upload" && (state.fileRekapBahanBaku || (state.customBlobsRekap && state.customBlobsRekap.length > 0))) {
+      tick("Memproses dokumen rekapitulasi bahan baku...");
+      const rekapList = await buildDynamicList(
+        [{ file: state.fileRekapBahanBaku, customBlobs: state.customBlobsRekap, keterangan: "" }],
+        165,
+        "formulir",
         imageJobs,
         tick
       );
-
-      // ----------------------------------------------------------------
-      // Kalau kategori ini sama sekali tidak ada berkas yang diunggah,
-      // isi 1 baris placeholder "Tidak ada <label>." -- bukan array kosong
-      // -- supaya urutan/struktur LHV tetap ikut template, hanya saja
-      // bagian yang memang tidak dimiliki perusahaan diberi keterangan
-      // eksplisit. "gambar" sengaja dikosongkan (bukan token gambar)
-      // supaya docx-engine.js tahu ini baris placeholder (lihat
-      // sanitizeMissingDataText di docx-engine.js) dan tidak menampilkan
-      // prefix "Keterangan: " di depannya.
-      // ----------------------------------------------------------------
-      if (daftar.length === 0 && cfg.noDataLabel) {
-        daftar = [{ judul: "", keterangan: `Tidak ada ${cfg.noDataLabel}.`, gambar: "" }];
-      }
-
-      context[cfg.contextKey] = daftar;
+      rekapToken = rekapList.map((r) => r.gambar).join(" ");
     }
 
-    // --- PENANGANAN KHUSUS: foto_produk ---
-    // Di template Kerjasama, tag "foto_produk" dipakai DUA KALI dengan peran
-    // berbeda: (1) {{ foto_produk }} sebagai SATU foto tunggal di Ringkasan
-    // Eksekutif, dan (2) {% for baris in foto_produk | batch(2,None) %}
-    // sebagai GALERI banyak foto di Dokumen Pendukung. Kalau context.foto_produk
-    // cuma berupa array biasa, peran (1) akan tampil rusak/berantakan (array
-    // ikut ter-render jadi teks, bukan gambar) -- ini penyebab hasil "tertukar"
-    // untuk skema Kerjasama. Solusinya: array yang sama dipakai untuk peran (2)
-    // (for-loop tetap bisa iterasi normal), TAPI diberi toString() khusus supaya
-    // saat dipakai sebagai {{ foto_produk }} tunggal, ia otomatis menampilkan
-    // 1 foto saja: foto "Foto Produk Utama" (kalau diisi di tab Ringkasan
-    // Eksekutif), atau foto pertama dari galeri sebagai cadangan.
-    const galeriFotoProduk = context.foto_produk || [];
-    let fotoProdukTunggalToken = "";
-    if (state.fileFotoProdukUtama) {
-      const token = nextToken("foto_produk_utama");
-      imageJobs.set(token, { blob: state.fileFotoProdukUtama, widthMm: 70 });
-      fotoProdukTunggalToken = token;
-    } else if (galeriFotoProduk.length > 0) {
-      fotoProdukTunggalToken = galeriFotoProduk[0].gambar;
-    }
-    galeriFotoProduk.toString = () => fotoProdukTunggalToken;
-    context.foto_produk = galeriFotoProduk;
-
-    return { context, imageJobs, tableJobs };
-  }
-
-  function bersihkanTeks(teks) {
-    if (!teks) return "Kosong";
-    let t = String(teks);
-    for (const ch of ["\\", "/", "*", "?", '"', "<", ">", "|", ":"]) {
-      t = t.split(ch).join("_");
-    }
-    return t;
-  }
-
-  function buatInisial(namaVerifikator) {
-    const nama = (namaVerifikator || "").trim();
-    return nama
-      ? nama.split(/\s+/).map((k) => k[0].toUpperCase()).join("")
-      : "VER";
-  }
-
-  function buildFilename(state) {
-    const idB = bersihkanTeks(state.idBerkas);
-    const np = bersihkanTeks(state.namaPerusahaan);
-    const nprod = bersihkanTeks(state.jenisBarang);
-    const inisial = buatInisial(state.namaVerifikator);
-    const teksJenis = state.jenisLhv === "BMP" ? "LHV BMP" : "LHV TKDN";
-    return `${idB}_${teksJenis} ${np}_${nprod}_${inisial}.docx`;
-  }
-
-  // Format resmi: TKDN{tahun}-{bulan}-BBSPJPPI-{ID Berkas}-{Inisial Verifikator}
-  // (dipakai di cover laporan, bukan di badan dokumen -- badan dokumen tetap
-  // menampilkan ID Berkas apa adanya lewat tag {{ id_berkas }})
-  function buildNoLhv(state) {
-    const prefix = state.jenisLhv === "BMP" ? "BMP" : "TKDN";
-    let tahun = new Date().getFullYear();
-    let bulan = new Date().getMonth() + 1;
-    if (state.tanggalLhv && /^\d{4}-\d{2}/.test(state.tanggalLhv)) {
-      const [y, m] = state.tanggalLhv.split("-");
-      tahun = parseInt(y, 10);
-      bulan = parseInt(m, 10);
-    }
-    const idB = (state.idBerkas || "").trim() || "-";
-    const inisial = buatInisial(state.namaVerifikator);
-    return `${prefix}${tahun}-${bulan}-BBSPJPPI-${idB}-${inisial}`;
-  }
-
-  // --------------------------------------------------------------------
-  // Orkestrasi utama: bangun context -> render -> unduh
-  // --------------------------------------------------------------------
-  async function generateAndDownload(state, onProgress) {
-    const templatePath = TEMPLATE_MAP[state.jenisLhv];
-    if (!templatePath) throw new Error(`Jenis LHV "${state.jenisLhv}" tidak dikenali.`);
-
-    // --- Basis progress bar (persentase) ---
-    // Penyebut = jumlah file/gambar yang akan diproses (dihitung di muka)
-    // + 5 tahap tetap: 1 memuat template + 4 tahap di dalam DocxEngine
-    // (buka template, render teks, sisipkan gambar, susun ulang .docx).
-    // Ini estimasi berbobot-rata, bukan pengukuran waktu presisi -- cukup
-    // untuk menaikkan progress bar secara mulus & konsisten sampai 100%
-    // saat file benar-benar jadi.
-    const ENGINE_FIXED_STEPS = 5;
-    const totalSteps = Math.max(1, countFileItems(state) + ENGINE_FIXED_STEPS);
-    let doneSteps = 0;
-    let lastPercent = 0;
-
-    // Pesan "label" (mis. nama kategori) -- update teks status TANPA menaikkan persentase
-    const softProgress = (msg) => {
-      onProgress && onProgress(msg, lastPercent);
-    };
-    // Setiap unit pekerjaan selesai -- naikkan persentase (dibatasi 99% sampai file benar-benar selesai diunduh)
-    const tick = (msg) => {
-      doneSteps += 1;
-      lastPercent = Math.min(99, Math.round((doneSteps / totalSteps) * 100));
-      onProgress && onProgress(msg, lastPercent);
+    const noLhv = buildNoLhv(state);
+    const context = {
+      ...dynamicContext,
+      no_lhv: noLhv,
+      nama_perusahaan: state.namaPerusahaan || "",
+      tanggal_lhv: formatTanggalIndo(state.tanggalLhv),
+      id_berkas: state.idBerkas || "",
+      permenperin: state.permenperin || "",
+      tgl_verifikasi_dok: formatTanggalIndo(state.tglVerifikasiDok),
+      tgl_verifikasi_lapangan: formatTanggalIndo(state.tglVerifikasiLapangan),
+      kbli: state.kbli || "",
+      kapasitas_produksi: state.kapasitasProduksi || "",
+      jenis_barang: state.jenisBarang || "",
+      tipe_barang: state.tipeBarang || "",
+      spesifikasi_barang: state.spesifikasiBarang || "",
+      kode_hs: state.kodeHs || "",
+      merek_barang: state.merekBarang || "",
+      kelompok_barang: state.kelompokBarang || "",
+      nilai_tkdn: state.nilaiTkdn || "",
+      terbilang_tkdn: state.terbilangTkdn || "",
+      nilai_brainware: state.nilaiBrainware || "",
+      terbilang_brainware: state.terbilangBrainware || "",
+      nilai_bmp: state.nilaiBmp || "",
+      terbilang_bmp: state.terbilangBmp || "",
+      skala_perusahaan: state.skalaPerusahaan || "",
+      no_izin: state.noIzin || "",
+      nama_perusahaan_industri: state.namaPerusahaanIndustri || "",
+      alamat_perusahaan_industri: state.alamatPerusahaanIndustri || "",
+      skala_perusahaan_industri: state.skalaPerusahaanIndustri || "",
+      no_izin_perusahaan_industri: state.noIzinPerusahaanIndustri || "",
+      alamat_kantor: state.alamatKantor || "",
+      telepon_kantor: state.teleponKantor || "",
+      fax_kantor: state.faxKantor || "",
+      email_kantor: state.emailKantor || "",
+      website_kantor: state.websiteKantor || "",
+      status_kantor: state.statusKantor || "",
+      pic_kantor: state.picKantor || "",
+      akta_kantor: state.aktaKantor || "",
+      npwp_kantor: state.npwpKantor || "",
+      alamat_pabrik: state.alamatPabrik || "",
+      telepon_pabrik: state.teleponPabrik || "",
+      fax_pabrik: state.faxPabrik || "",
+      email_pabrik: state.emailPabrik || "",
+      website_pabrik: state.websitePabrik || "",
+      status_pabrik: state.statusPabrik || "",
+      pic_pabrik: state.picPabrik || "",
+      akta_pabrik: state.aktaPabrik || "",
+      npwp_pabrik: state.npwpPabrik || "",
+      telepon_kantor_industri: state.teleponKantorIndustri || "",
+      fax_kantor_industri: state.faxKantorIndustri || "",
+      email_kantor_industri: state.emailKantorIndustri || "",
+      website_kantor_industri: state.websiteKantorIndustri || "",
+      status_kantor_industri: state.statusKantorIndustri || "",
+      pic_kantor_industri: state.picKantorIndustri || "",
+      akta_kantor_industri: state.aktaKantorIndustri || "",
+      npwp_kantor_industri: state.npwpKantorIndustri || "",
+      nama_verifikator: state.namaVerifikator || "",
+      nip_verifikator: state.nipVerifikator || "",
+      pejabat_mengetahui: state.pejabatMengetahui || "",
+      nama_pejabat: state.namaPejabat || "",
+      nip_pejabat: state.nipPejabat || "",
+      acuan_peraturan: acuanFiltered,
+      aspek_bmp: aspekChecked,
+      rekap_bahan_baku: rekapClean,
+      mode_rekap_bahan_baku: state.modeRekapBahanBaku || "tabel",
+      rekap_bahan_baku_gambar: rekapToken,
+      logo_perusahaan: logoToken,
+      ttd_verifikator: ttdToken,
+      gambar_struktur: strukturToken,
+      gambar_alur_produksi: alurToken,
+      gambar_struktur_industri: strukturIndustriToken,
+      gambar_cover: coverToken,
+      foto_barang: fotoBarangToken,
+      foto_produk: fotoProdukUtamaToken || (dynamicContext.list_foto_produk?.[0]?.gambar_1 || ""),
     };
 
-    tick("Memuat file template...");
-    const resp = await fetch(templatePath);
-    if (!resp.ok) {
-      throw new Error(
-        `Template untuk skema "${state.jenisLhv}" belum tersedia di folder /templates ` +
-          `(${templatePath}). Silakan tambahkan file template tersebut, atau pilih skema lain.`
-      );
-    }
-    const templateArrayBuffer = await resp.arrayBuffer();
+    step("Menyusun dokumen Word (.docx)...");
+    const docxBlob = await DocxEngine.generateDocx(templateBuffer, context, imageJobs);
 
-    const { context, imageJobs, tableJobs } = await buildContext(state, softProgress, tick);
+    step("Menyiapkan unduhan...");
+    const safeName = (state.namaPerusahaan || "LHV")
+      .replace(/[\\/:*?"<>|]/g, "_")
+      .trim();
+    const filename = `LHV_${jenisLhv.replace(/\s+/g, "_")}_${safeName}.docx`;
 
-    const blob = await DocxEngine.generateDocx(templateArrayBuffer, context, imageJobs, tableJobs, tick);
-
-    const filename = buildFilename(state);
-    const url = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(docxBlob);
     const a = document.createElement("a");
     a.href = url;
     a.download = filename;
     document.body.appendChild(a);
     a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-    onProgress && onProgress(
-      blob.__leftoverTagCount
-        ? `Selesai! File ${filename} berhasil dibuat. ⚠️ Namun ditemukan ${blob.__leftoverTagCount} sisa tag template yang tidak sepenuhnya ter-render (sudah dibersihkan otomatis) -- mohon periksa kembali dokumen hasilnya, dan laporkan bagian ini kalau ada teks yang tampak janggal.`
-        : `Selesai! File ${filename} berhasil dibuat.`,
-      100
-    );
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 1500);
 
     return filename;
   }
 
-  // --------------------------------------------------------------------
-  // Penyimpanan proyek & draft di IndexedDB
-  // - STORE_NAME "projects": daftar LHV yang sudah pernah di-generate
-  // - DRAFT_STORE "draft": auto-save form yang sedang diisi (teks + file),
-  //   supaya kalau tab browser tertutup/refresh tidak sengaja, isian
-  //   verifikator tidak hilang.
-  // --------------------------------------------------------------------
+  // =========================================================================
+  // 5. PENYIMPANAN PROYEK LOKAL (INDEXEDDB)
+  // =========================================================================
   const DB_NAME = "lhv_generator_db";
-  const STORE_NAME = "projects";
-  const DRAFT_STORE = "draft";
-  const DRAFT_ID = "current";
+  const DB_VERSION = 1;
+  const STORE_PROJECTS = "projects";
+  const STORE_DRAFT = "draft";
 
   function openDb() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, 2);
-      req.onupgradeneeded = (ev) => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          db.createObjectStore(STORE_NAME, { keyPath: "id", autoIncrement: true });
+      if (!global.indexedDB) {
+        reject(new Error("IndexedDB tidak didukung oleh browser ini."));
+        return;
+      }
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
+          db.createObjectStore(STORE_PROJECTS, { keyPath: "id", autoIncrement: true });
         }
-        if (!db.objectStoreNames.contains(DRAFT_STORE)) {
-          db.createObjectStore(DRAFT_STORE, { keyPath: "id" });
+        if (!db.objectStoreNames.contains(STORE_DRAFT)) {
+          db.createObjectStore(STORE_DRAFT, { keyPath: "key" });
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -630,9 +577,10 @@
   async function dbSaveProject(project) {
     const db = await openDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      const store = tx.objectStore(STORE_NAME);
-      const req = project.id ? store.put(project) : store.add(project);
+      const tx = db.transaction(STORE_PROJECTS, "readwrite");
+      const req = project.id
+        ? tx.objectStore(STORE_PROJECTS).put(project)
+        : tx.objectStore(STORE_PROJECTS).add(project);
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
@@ -641,10 +589,9 @@
   async function dbListProjects() {
     const db = await openDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.getAll();
-      req.onsuccess = () => resolve(req.result || []);
+      const tx = db.transaction(STORE_PROJECTS, "readonly");
+      const req = tx.objectStore(STORE_PROJECTS).getAll();
+      req.onsuccess = () => resolve((req.result || []).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
       req.onerror = () => reject(req.error);
     });
   }
@@ -652,29 +599,28 @@
   async function dbDeleteProject(id) {
     const db = await openDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).delete(id);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      const tx = db.transaction(STORE_PROJECTS, "readwrite");
+      const req = tx.objectStore(STORE_PROJECTS).delete(id);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
     });
   }
 
-  // --- Auto-save draft (form yang sedang diisi, termasuk file) ---
-  async function dbSaveDraft(state) {
+  async function dbSaveDraft(stateObj) {
     const db = await openDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, "readwrite");
-      tx.objectStore(DRAFT_STORE).put({ id: DRAFT_ID, state, savedAt: Date.now() });
-      tx.oncomplete = () => resolve(true);
-      tx.onerror = () => reject(tx.error);
+      const tx = db.transaction(STORE_DRAFT, "readwrite");
+      const req = tx.objectStore(STORE_DRAFT).put({ key: "current", savedAt: Date.now(), state: stateObj });
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
     });
   }
 
   async function dbLoadDraft() {
     const db = await openDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, "readonly");
-      const req = tx.objectStore(DRAFT_STORE).get(DRAFT_ID);
+      const tx = db.transaction(STORE_DRAFT, "readonly");
+      const req = tx.objectStore(STORE_DRAFT).get("current");
       req.onsuccess = () => resolve(req.result || null);
       req.onerror = () => reject(req.error);
     });
@@ -683,24 +629,23 @@
   async function dbClearDraft() {
     const db = await openDb();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, "readwrite");
-      tx.objectStore(DRAFT_STORE).delete(DRAFT_ID);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      const tx = db.transaction(STORE_DRAFT, "readwrite");
+      const req = tx.objectStore(STORE_DRAFT).delete("current");
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
     });
   }
 
   global.LHVLogic = {
     generateAndDownload,
-    buildContext,
-    buildFilename,
     buildNoLhv,
+    formatTanggalIndo,
+    nilaiKeTerbilangPersen,
     dbSaveProject,
     dbListProjects,
     dbDeleteProject,
     dbSaveDraft,
     dbLoadDraft,
     dbClearDraft,
-    TEMPLATE_MAP,
   };
 })(window);

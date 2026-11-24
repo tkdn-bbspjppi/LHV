@@ -149,6 +149,27 @@
   // =========================================================================
   // 2. PRE-PROCESSING XML WORD (GABUNG RUN TERPECAH + NORMALISASI TAG JINJA)
   // =========================================================================
+  function decodeEntities(s) {
+    return s
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+  }
+
+  function stripInlineXml(s) {
+    return decodeEntities(s.replace(/<[^>]+>/g, ""))
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/\u00A0/g, " ");
+  }
+
+  function normalizeJinjaTag(rawTag) {
+    let cleanTag = stripInlineXml(rawTag);
+    cleanTag = cleanTag.replace(/\.length\b/g, " | length");
+    return cleanTag;
+  }
+
   function mergeSplitTagRuns(xml) {
     return xml.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (paraXml) => {
       const tMatches = [...paraXml.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g)];
@@ -166,19 +187,6 @@
         return `<w:t${attrs}></w:t>`;
       });
     });
-  }
-
-  function decodeEntities(s) {
-    return s
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&apos;/g, "'");
-  }
-
-  function stripInlineXml(s) {
-    return decodeEntities(s.replace(/<[^>]+>/g, ""));
   }
 
   function preprocessDocxXml(xml) {
@@ -206,24 +214,23 @@
       return `${prefix}${currentTr}${suffix}`;
     });
 
-    // 2. Paragraf yang hanya berisi tag kontrol ({% ... %})
+    // 2. Proses setiap paragraf <w:p> secara terisolasi (tidak pernah lintas paragraf)
     out = out.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (pXml) => {
       const plain = stripInlineXml(pXml).trim();
-      if (/^\{%-?[\s\S]*?-?%\}$/.test(plain)) {
-        return plain;
+
+      // Jika seluruh paragraf hanya berisi satu atau lebih tag kontrol {% ... %}
+      if (/^(?:\{%-?[\s\S]*?-?%\}\s*)+$/.test(plain)) {
+        return plain.replace(/\{%[\s\S]*?%\}/g, (t) => normalizeJinjaTag(t));
       }
-      return pXml;
-    });
 
-    // 3. Bersihkan XML di dalam {{ ... }} dan {% ... %} serta amankan .length
-    out = out.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) => {
-      let cleanTag = stripInlineXml(tag);
-      cleanTag = cleanTag.replace(/\.length\b/g, " | length");
-      return cleanTag;
-    });
+      // Placeholder khusus tabel Rekapitulasi Bahan Baku ({{ tabel_rekap }})
+      if (/\{\{\s*tabel_rekap\s*\}\}/.test(plain)) {
+        return "{{ tabel_rekap | safe }}";
+      }
 
-    // 4. Placeholder khusus tabel Rekapitulasi Bahan Baku ({{ tabel_rekap }})
-    out = out.replace(/<w:p\b[^>]*>[\s\S]*?\{\{\s*tabel_rekap\s*\}\}[\s\S]*?<\/w:p>/g, "{{ tabel_rekap | safe }}");
+      // Bersihkan tag Jinja di dalam teks paragraf ini saja
+      return pXml.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) => normalizeJinjaTag(tag));
+    });
 
     return out;
   }
@@ -246,16 +253,12 @@
     return val;
   }
 
-  /**
-   * Kumpulkan seluruh nama variabel yang direferensikan di dalam tag {{ ... }} atau {% ... %}
-   * lalu isi default "" bila belum ada di safeCtx agar Nunjucks tidak pernah menemui undefined.
-   */
   function ensureAllTemplateVarsDefined(preparedXml, ctxObj) {
     const keywords = new Set([
       "if", "elif", "else", "endif", "for", "in", "endfor", "set", "block", "endblock",
       "extends", "include", "import", "from", "as", "macro", "endmacro", "call", "endcall",
       "filter", "endfilter", "raw", "endraw", "and", "or", "not", "is", "true", "false",
-      "none", "null", "undefined", "loop", "super", "self", "true", "false", "length", "safe"
+      "none", "null", "undefined", "loop", "super", "self", "length", "safe"
     ]);
     const tags = preparedXml.match(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g) || [];
     for (const tag of tags) {
@@ -267,6 +270,30 @@
         }
       }
     }
+  }
+
+  /**
+   * Cari tag Jinja pertama yang menyebabkan error saat dikompilasi/dirender Nunjucks.
+   */
+  function findBrokenTag(env, preparedXml, renderCtx) {
+    const tags = preparedXml.match(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g) || [];
+    for (const tag of tags) {
+      if (/^\{\{/.test(tag)) {
+        try {
+          env.renderString(tag, renderCtx);
+        } catch (e) {
+          return `${tag} -> ${e.message}`;
+        }
+      }
+    }
+    // Cek blok kontrol tidak berpasangan atau rusak
+    const ctrlTags = preparedXml.match(/\{%[\s\S]*?%\}/g) || [];
+    for (const ct of ctrlTags) {
+      if (/\{%[\s\S]*?\{%/.test(ct)) {
+        return `Tag tumpang tindih: ${ct.slice(0, 120)}`;
+      }
+    }
+    return `Jumlah tag kontrol: ${ctrlTags.length} | Contoh awal: ${ctrlTags.slice(0, 5).join(" ")}`;
   }
 
   /**
@@ -322,7 +349,6 @@
       const rawXml = await zip.file(xmlPath).async("string");
       const prepared = preprocessDocxXml(rawXml);
 
-      // Pastikan seluruh identifier yang dipakai di template tersedia di safeCtx
       const renderCtx = Object.assign({}, safeCtx);
       ensureAllTemplateVarsDefined(prepared, renderCtx);
 
@@ -330,14 +356,8 @@
       try {
         rendered = env.renderString(prepared, renderCtx);
       } catch (err) {
-        const lineMatch = err.message.match(/\[Line\s+(\d+)/i);
-        let hint = "";
-        if (lineMatch) {
-          const lines = prepared.split("\n");
-          const ln = Math.max(0, parseInt(lineMatch[1], 10) - 1);
-          hint = ` | Potongan: ${String(lines[ln] || "").slice(0, 180)}`;
-        }
-        throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}${hint}`);
+        const detail = findBrokenTag(env, prepared, renderCtx);
+        throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message} [${detail}]`);
       }
 
       // Kunci baris tabel yang berisi gambar agar tidak terpotong antar halaman

@@ -186,18 +186,24 @@
 
     // 1. Tag loop baris tabel docxtpl: {% tr for ... %} ... {% tr endfor %}
     out = out.replace(/<w:tr\b[^>]*>[\s\S]*?<\/w:tr>/g, (trXml) => {
-      const mStart = trXml.match(/\{%-?\s*tr\s+(for\b[\s\S]*?)-?%\}/);
+      let currentTr = trXml;
+      let prefix = "";
+      let suffix = "";
+
+      const mStart = currentTr.match(/\{%-?\s*tr\s+(for\b[\s\S]*?)-?%\}/);
       if (mStart) {
         const expr = stripInlineXml(mStart[1]);
-        const cleanedTr = trXml.replace(mStart[0], "");
-        return `{% ${expr} %}${cleanedTr}`;
+        currentTr = currentTr.replace(mStart[0], "");
+        prefix = `{% ${expr} %}`;
       }
-      const mEnd = trXml.match(/\{%-?\s*tr\s+endfor\s*-?%\}/);
+
+      const mEnd = currentTr.match(/\{%-?\s*tr\s+endfor\s*-?%\}/);
       if (mEnd) {
-        const cleanedTr = trXml.replace(mEnd[0], "");
-        return `${cleanedTr}{% endfor %}`;
+        currentTr = currentTr.replace(mEnd[0], "");
+        suffix = `{% endfor %}`;
       }
-      return trXml;
+
+      return `${prefix}${currentTr}${suffix}`;
     });
 
     // 2. Paragraf yang hanya berisi tag kontrol ({% ... %})
@@ -223,7 +229,7 @@
   }
 
   // =========================================================================
-  // 3. ESCAPE DATA KONTEKS & PENGUNCIAN TATA LETAK CETAK
+  // 3. ESCAPE DATA KONTEKS, SAFE PROXY & PENGUNCIAN TATA LETAK CETAK
   // =========================================================================
   function escapeContext(val) {
     if (val === null || val === undefined) return "";
@@ -238,6 +244,38 @@
       return out;
     }
     return val;
+  }
+
+  /**
+   * Bungkus konteks dengan Proxy agar setiap variabel yang tidak ada di context
+   * otomatis mengembalikan "" (memiliki .length === 0 dan aman di-loop).
+   */
+  function createSafeContextProxy(obj) {
+    if (!obj || typeof obj !== "object") return obj;
+    const ignoredProps = new Set([
+      "then", "__proto__", "prototype", "constructor", "toJSON", "valueOf", "toString"
+    ]);
+    return new Proxy(obj, {
+      has(target, prop) {
+        if (typeof prop === "symbol" || ignoredProps.has(prop)) {
+          return prop in target;
+        }
+        return true;
+      },
+      get(target, prop, receiver) {
+        if (typeof prop === "symbol") {
+          return Reflect.get(target, prop, receiver);
+        }
+        if (prop in target) {
+          const val = target[prop];
+          return val === undefined || val === null ? "" : val;
+        }
+        if (ignoredProps.has(prop)) {
+          return undefined;
+        }
+        return "";
+      },
+    });
   }
 
   /**
@@ -262,6 +300,12 @@
 
     const env = new nunjucks.Environment(null, { autoescape: false, throwOnUndefined: false });
     env.addFilter("safe", (s) => s);
+    env.addFilter("length", (v) => {
+      if (v === null || v === undefined) return 0;
+      if (typeof v.length === "number") return v.length;
+      if (typeof v === "object") return Object.keys(v).length;
+      return 0;
+    });
 
     const safeCtx = escapeContext(context);
     if (Array.isArray(context.rekap_bahan_baku) && context.rekap_bahan_baku.length > 0) {
@@ -269,6 +313,7 @@
     } else {
       safeCtx.tabel_rekap = "";
     }
+    const proxiedCtx = createSafeContextProxy(safeCtx);
 
     const relsPath = "word/_rels/document.xml.rels";
     let relsXml = await zip.file(relsPath).async("string");
@@ -288,7 +333,7 @@
       const prepared = preprocessDocxXml(rawXml);
       let rendered;
       try {
-        rendered = env.renderString(prepared, safeCtx);
+        rendered = env.renderString(prepared, proxiedCtx);
       } catch (err) {
         throw new Error(`Gagal mengevaluasi tag template pada ${xmlPath}: ${err.message}`);
       }

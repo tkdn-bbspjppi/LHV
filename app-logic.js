@@ -13,7 +13,7 @@
   }
 
   // =========================================================================
-  // 1. NOMOR LHV OTOMATIS & FORMAT TANGGAL INDONESIA
+  // 1. NOMOR LHV OTOMATIS, FORMAT TANGGAL & TERBILANG INDONESIA
   // =========================================================================
   const BULAN_ID = [
     "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
@@ -28,6 +28,52 @@
     const [y, m, d] = parts;
     const bln = BULAN_ID[parseInt(m, 10)] || m;
     return `${parseInt(d, 10)} ${bln} ${y}`;
+  }
+
+  function angkaKeTerbilang(n) {
+    const satuan = [
+      "", "Satu", "Dua", "Tiga", "Empat", "Lima",
+      "Enam", "Tujuh", "Delapan", "Sembilan", "Sepuluh", "Sebelas"
+    ];
+    n = Math.floor(Math.abs(n));
+    if (n === 0) return "Nol";
+    if (n < 12) return satuan[n];
+    if (n < 20) return angkaKeTerbilang(n - 10) + " Belas";
+    if (n < 100) {
+      return satuan[Math.floor(n / 10)] + " Puluh" + (n % 10 !== 0 ? " " + angkaKeTerbilang(n % 10) : "");
+    }
+    if (n < 200) {
+      return "Seratus" + (n - 100 !== 0 ? " " + angkaKeTerbilang(n - 100) : "");
+    }
+    if (n < 1000) {
+      return satuan[Math.floor(n / 100)] + " Ratus" + (n % 100 !== 0 ? " " + angkaKeTerbilang(n % 100) : "");
+    }
+    return String(n);
+  }
+
+  function nilaiKeTerbilangPersen(nilaiStr) {
+    if (nilaiStr === null || nilaiStr === undefined) return "";
+    const cleaned = String(nilaiStr).replace(/%/g, "").trim();
+    if (!cleaned) return "";
+
+    const num = parseFloat(cleaned.replace(",", "."));
+    if (isNaN(num)) return "";
+
+    const fixed = num.toFixed(2);
+    const [bulatStr, desimalStr] = fixed.split(".");
+    const bulat = parseInt(bulatStr, 10);
+
+    let hasil = angkaKeTerbilang(bulat);
+    if (desimalStr && desimalStr !== "00") {
+      const d1 = parseInt(desimalStr[0], 10);
+      const d2 = parseInt(desimalStr[1], 10);
+      const kataDesimal = [
+        d1 === 0 ? "Nol" : angkaKeTerbilang(d1),
+        d2 === 0 ? "Nol" : angkaKeTerbilang(d2),
+      ].join(" ");
+      hasil += " Koma " + kataDesimal;
+    }
+    return hasil + " Persen";
   }
 
   function buatInisial(nama) {

@@ -134,7 +134,7 @@
   }
 
   // =========================================================================
-  // 2. PRE-PROCESSING XML WORD BERBASIS DOM (AMAN UNTUK <w:sdt> & <w:tc>)
+  // 2. PRE-PROCESSING XML WORD BERBASIS DOM
   // =========================================================================
   function cleanText(s) {
     return String(s || "")
@@ -147,9 +147,27 @@
   }
 
   /**
-   * Memproses XML Word menggunakan DOMParser sehingga pasangan tag seperti
-   * <w:sdt>, <w:sdtContent>, <w:tc>, dan <w:tr> tidak pernah terpotong atau tertukar.
+   * Lepas pembungkus Content Control Word (<w:sdt> / <w:sdtContent>) sambil
+   * mempertahankan seluruh isi di dalamnya agar tidak pernah terpotong oleh tag Jinja.
    */
+  function unwrapContentControls(doc) {
+    let sdts = Array.from(doc.getElementsByTagNameNS(W_NS, "sdt"));
+    while (sdts.length > 0) {
+      for (const sdt of sdts) {
+        const parent = sdt.parentNode;
+        if (!parent) continue;
+        const sdtContent = sdt.getElementsByTagNameNS(W_NS, "sdtContent")[0];
+        if (sdtContent) {
+          while (sdtContent.firstChild) {
+            parent.insertBefore(sdtContent.firstChild, sdt);
+          }
+        }
+        parent.removeChild(sdt);
+      }
+      sdts = Array.from(doc.getElementsByTagNameNS(W_NS, "sdt"));
+    }
+  }
+
   function preprocessDocxDom(rawXml) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(rawXml, "application/xml");
@@ -157,6 +175,9 @@
     if (parseErr) {
       throw new Error(`Template XML rusak: ${parseErr.textContent}`);
     }
+
+    // 0. Lepas semua <w:sdt> agar tidak ada mismatch <w:sdtContent> vs <w:tc>
+    unwrapContentControls(doc);
 
     // 1. Gabungkan teks terpecah (<w:t>) di dalam tiap paragraf <w:p> dan bersihkan tag Jinja
     const paragraphs = Array.from(doc.getElementsByTagNameNS(W_NS, "p"));
@@ -167,14 +188,12 @@
       const fullText = cleanText(tNodes.map((t) => t.textContent || "").join(""));
       if (!/\{\{|\{%|\{#/.test(fullText)) continue;
 
-      // Jika paragraf ini adalah placeholder {{ tabel_rekap }}
       if (/^\{\{\s*tabel_rekap\s*\}\}$/.test(fullText.trim())) {
         const placeholderNode = doc.createTextNode("{{ tabel_rekap | safe }}");
         p.parentNode.replaceChild(placeholderNode, p);
         continue;
       }
 
-      // Jika seluruh paragraf hanya berisi tag kontrol {% ... %} (bukan {% tr ... %})
       const trimmed = fullText.trim();
       if (
         /^(?:\{%-?[\s\S]*?-?%\}\s*)+$/.test(trimmed) &&
@@ -186,7 +205,6 @@
         continue;
       }
 
-      // Normalisasi ekspresi Jinja di dalam paragraf dan taruh utuh di <w:t> pertama
       const normalizedParaText = fullText.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) =>
         normalizeJinjaExpression(tag)
       );
@@ -302,10 +320,6 @@
     });
   }
 
-  /**
-   * Pastikan setiap wadah blok (<w:tc> dan <w:sdtContent> di dalam tabel/blok)
-   * selalu memenuhi aturan skema OpenXML Word.
-   */
   function sanitizeWordDom(xmlString, xmlPath) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlString, "application/xml");
@@ -333,16 +347,6 @@
         if (lastEl && lastEl.localName === "tbl") {
           tc.appendChild(doc.createElementNS(W_NS, "w:p"));
         }
-      }
-    }
-
-    // 3. Jika <w:sdtContent> berada langsung di dalam <w:tc> dan menjadi kosong, sisipkan <w:p/>
-    const sdtContents = Array.from(doc.getElementsByTagNameNS(W_NS, "sdtContent"));
-    for (const sc of sdtContents) {
-      const parentSdt = sc.parentNode;
-      const grandParent = parentSdt && parentSdt.parentNode;
-      if (grandParent && grandParent.localName === "tc" && sc.children.length === 0) {
-        sc.appendChild(doc.createElementNS(W_NS, "w:p"));
       }
     }
 

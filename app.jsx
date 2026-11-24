@@ -94,7 +94,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
           const saved = initialRects && initialRects[i - 1];
           const rect = saved ? { ...saved.rect } : detectInitialCropRatio(canvas, isFormulir);
           const included = saved ? saved.included : true;
-          loaded.push({ pageNum: i, canvas, rect, included });
+          loaded.push({ pageNum: i, canvas, rect, included, url: canvas.toDataURL(), thumb: canvas.toDataURL('image/jpeg', 0.45) });
         }
         if (!cancelled) {
           setPages(loaded);
@@ -287,7 +287,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
                       <span>Pakai</span>
                     </label>
                   </div>
-                  <img src={p.canvas.toDataURL('image/jpeg', 0.45)} alt="" style={{ width: '100%', display: 'block', border: '1px solid #e2e8f0' }} />
+                  <img src={p.thumb} alt="" style={{ width: '100%', display: 'block', border: '1px solid #e2e8f0' }} />
                 </div>
               ))}
             </div>
@@ -300,7 +300,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
               {current && (
                 <div ref={overlayRef} style={{ position: 'relative', display: 'inline-block', userSelect: 'none', boxShadow: '0 4px 16px rgba(0,0,0,0.25)' }}>
                   <img
-                    src={current.canvas.toDataURL()}
+                    src={current.url}
                     alt={`Halaman ${current.pageNum}`}
                     style={{ maxHeight: '72vh', width: 'auto', display: 'block', pointerEvents: 'none' }}
                   />
@@ -666,6 +666,7 @@ function App() {
     { id: 4, type: 'fixed', aturan: 'Peraturan Sekretaris Jenderal Kementerian Perindustrian Nomor 5 Tahun 2025 tentang Petunjuk Teknis Penghitungan Nilai TKDN Barang dan Jasa Industri' },
     { id: 5, type: 'fixed', aturan: 'Keputusan Kepala Badan Standardisasi dan Kebijakan Jasa Industri Tahun 2026 tentang Pedoman Penyelenggaraan Layanan Penghitungan dan Verifikasi Nilai Tingkat Komponen Dalam Negeri dan Bobot Manfaat Perusahaan di Lingkungan Badan Standardisasi dan Kebijakan Jasa Industri' },
     { id: 6, type: 'dropdown', aturan: 'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri', options: [
+      'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
       'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Kementerian Perindustrian Nomor 2 Tahun 2026 tentang Perubahan atas Peraturan Dirjen ILMATE Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
       'Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 113 Tahun 2026 tentang Perubahan atas Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 263 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKMA untuk Penghitungan TKDN',
       'Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 8 Tahun 2026 tentang Perubahan atas Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKFT untuk Penghitungan Nilai TKDN',
@@ -815,7 +816,8 @@ function App() {
     namaPejabat: setNamaPejabat,
     nipPejabat: setNipPejabat,
     acuanPeraturan: setAcuanPeraturan,
-    formulirVerifikasi: setFormulirVerifikasi,
+    formulirVerifikasiList: setFormulirVerifikasi,
+    templateVarian: setTemplateVarian,
     modeFormulir: setModeFormulir,
     fileFormulirGabungan: setFileFormulirGabungan,
     teleponKantor: setTeleponKantor,
@@ -897,6 +899,8 @@ function App() {
 
   const buildFullState = () => ({
     customBlobsSingle,
+    modeFormulir, fileFormulirGabungan, templateVarian,
+    formulirVerifikasiList: formulirVerifikasi,
     jenisLhv, namaPerusahaan, tanggalLhv, idBerkas, permenperin,
     coverMode, coverColor, kbliDeskripsi, namaLembagaCover, fileFotoCover,
     skalaPerusahaan, noIzin,
@@ -975,7 +979,13 @@ function App() {
 
   const generateDefaultForms = (aturan) => {
     let jumlah = aturan.includes('31 Tahun 2022') ? 15 : aturan.includes('22 Tahun 2020') ? 12 : 4;
-    setFormulirVerifikasi(Array.from({ length: jumlah }, (_, i) => ({ id: Date.now() + i, judul: `Formulir 1.${i + 1}`, file: null })));
+    setFormulirVerifikasi((prev) => {
+      const defaults = Array.from({ length: jumlah }, (_, i) => ({ id: Date.now() + i, judul: `Formulir 1.${i + 1}`, file: null }));
+      const kept = (prev || []).map((f, i) => ({ f, i })).filter(({ f }) => f && f.file);
+      const extras = [];
+      kept.forEach(({ f, i }) => { if (i < jumlah) defaults[i] = f; else extras.push(f); });
+      return [...defaults, ...extras];
+    });
   };
 
   useEffect(() => {
@@ -990,7 +1000,7 @@ function App() {
             if (d[key] !== undefined && d[key] !== null) allSetters[key](d[key]);
           });
           if (d.permenperin) loadedPermenperin = d.permenperin;
-          if (Array.isArray(d.formulirVerifikasi) && d.formulirVerifikasi.length > 0 && d.modeFormulir !== 'gabungan') {
+          if (Array.isArray(d.formulirVerifikasiList) && d.formulirVerifikasiList.length > 0) {
             hasSavedForms = true;
           }
           setDraftInfo({ savedAt: rec.savedAt });
@@ -1344,7 +1354,7 @@ function App() {
                     <div>
                       <label style={{ fontWeight: 'bold', fontSize: '13px' }}>Varian Desain Cover:</label><br />
                       <select value={templateVarian} onChange={(e) => setTemplateVarian(e.target.value)} style={inputStyle}>
-                        {(CoverGenerator.TEMPLATES[jenisLhv === 'BMP' ? 'bmp' : jenisLhv === 'Jasa' ? 'jasa' : 'tkdn'] || []).map(id => (
+                        {((typeof CoverGenerator !== 'undefined' && CoverGenerator.TEMPLATES[jenisLhv === 'BMP' ? 'bmp' : jenisLhv === 'Jasa' ? 'jasa' : 'tkdn']) || []).map(id => (
                           <option key={id} value={id}>{id}</option>
                         ))}
                       </select>

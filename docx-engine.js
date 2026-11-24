@@ -209,8 +209,12 @@
       return pXml;
     });
 
-    // 3. Bersihkan XML di dalam {{ ... }} dan {% ... %}
-    out = out.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) => stripInlineXml(tag));
+    // 3. Bersihkan XML di dalam {{ ... }} dan {% ... %} serta amankan .length
+    out = out.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) => {
+      let cleanTag = stripInlineXml(tag);
+      cleanTag = cleanTag.replace(/\.length\b/g, " | length");
+      return cleanTag;
+    });
 
     // 4. Placeholder khusus tabel Rekapitulasi Bahan Baku ({{ tabel_rekap }})
     out = out.replace(/<w:p\b[^>]*>[\s\S]*?\{\{\s*tabel_rekap\s*\}\}[\s\S]*?<\/w:p>/g, "{{ tabel_rekap | safe }}");

@@ -8,6 +8,7 @@
   const EMU_PER_MM = 36000;
   const EMU_PER_PX_96DPI = 9525;
   const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 
   // =========================================================================
   // 1. UTILITAS GAMBAR & XML
@@ -223,7 +224,7 @@
           trEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), trEl);
           return "";
         });
-        txt = txt.replace(/\{%-?\s*tr\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+        txt = txt.replace(/\{%-?\s*tr\s+(endfor|endif|else|elif\b[\s\S]*?)\s*-?%\}/g, (_, expr) => {
           trEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), trEl.nextSibling);
           return "";
         });
@@ -235,7 +236,7 @@
           tcEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), tcEl);
           return "";
         });
-        txt = txt.replace(/\{%-?\s*tc\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+        txt = txt.replace(/\{%-?\s*tc\s+(endfor|endif|else|elif\b[\s\S]*?)\s*-?%\}/g, (_, expr) => {
           tcEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), tcEl.nextSibling);
           return "";
         });
@@ -247,7 +248,7 @@
           pEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), pEl);
           return "";
         });
-        txt = txt.replace(/\{%-?\s*p\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+        txt = txt.replace(/\{%-?\s*p\s+(endfor|endif|else|elif\b[\s\S]*?)\s*-?%\}/g, (_, expr) => {
           pEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), pEl.nextSibling);
           return "";
         });
@@ -259,7 +260,7 @@
           rEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), rEl);
           return "";
         });
-        txt = txt.replace(/\{%-?\s*r\s+(endfor|endif|else|elif\b[\s\S]*?)-?%\}/g, (_, expr) => {
+        txt = txt.replace(/\{%-?\s*r\s+(endfor|endif|else|elif\b[\s\S]*?)\s*-?%\}/g, (_, expr) => {
           rEl.parentNode.insertBefore(doc.createTextNode(`{% ${expr.trim()} %}`), rEl.nextSibling);
           return "";
         });
@@ -529,7 +530,7 @@
 
           const mediaIndex = imageJobs._nextMedia++;
           const mediaFile = `media/img_${mediaIndex}.${norm.ext}`;
-          zip.file(`word/${mediaFile}`, norm.buffer);
+          zip.file(`word/${mediaFile}`, norm.buffer, { createFolders: false });
           addedExts.add(norm.ext);
           job._media = { mediaFile, ext: norm.ext, cx, cy };
         }
@@ -649,7 +650,7 @@
         addedExts,
         rekapXml
       );
-      zip.file(xmlPath, finalized);
+      zip.file(xmlPath, XML_DECL + finalized, { createFolders: false });
       if (jobs._newRels.length > 0) newRelsByPart[xmlPath] = jobs._newRels.slice();
     }
 
@@ -661,7 +662,7 @@
         ? await existing.async("string")
         : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
       rx = rx.replace("</Relationships>", `${rels.join("")}</Relationships>`);
-      zip.file(rp, rx);
+      zip.file(rp, rx, { createFolders: false });
     }
 
     for (const ext of addedExts) {
@@ -675,9 +676,18 @@
       }
     }
 
-    zip.file("[Content_Types].xml", contentTypesXml);
+    zip.file("[Content_Types].xml", contentTypesXml, { createFolders: false });
 
-    return await zip.generateAsync({
+    // Bangun ulang ZIP TANPA entri folder (word/, word/media/, ...). Word menolak membuka .docx
+    // yang berisi entri folder ("Word experienced an error trying to open the file").
+    const outZip = new JSZip();
+    const names = Object.keys(zip.files).filter((n) => !zip.files[n].dir);
+    names.sort((a, b) => (a === "[Content_Types].xml" ? -1 : b === "[Content_Types].xml" ? 1 : 0));
+    for (const name of names) {
+      outZip.file(name, await zip.file(name).async("uint8array"), { createFolders: false });
+    }
+
+    return await outZip.generateAsync({
       type: "blob",
       mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       compression: "DEFLATE",

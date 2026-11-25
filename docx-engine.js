@@ -252,6 +252,31 @@
       }
     }
 
+    // Tahap 1b: {% for/if %} dibuka di satu sel dan ditutup di sel lain pada BARIS yang sama
+    // (tanpa awalan tr). Jika dirender apa adanya, struktur sel rusak dan Word gagal membuka file.
+    // Perlakukan sebagai tag baris: {%tr for ... %} ... {%tr endfor %}.
+    const bal = (str) =>
+      (str.match(/\{%-?\s*(?:for|if)\b/g) || []).length -
+      (str.match(/\{%-?\s*end(?:for|if)\b/g) || []).length;
+    for (const tr of Array.from(doc.getElementsByTagNameNS(W_NS, "tr"))) {
+      const tcs = Array.from(tr.childNodes).filter((n) => n.localName === "tc" && n.namespaceURI === W_NS);
+      if (tcs.length < 2) continue;
+      const cellTexts = tcs.map((tc) =>
+        Array.from(tc.getElementsByTagNameNS(W_NS, "t")).map((t) => t.textContent || "").join("")
+      );
+      const bals = cellTexts.map(bal);
+      if (bals.some((x) => x !== 0) && bals.reduce((a, c) => a + c, 0) === 0) {
+        tcs.forEach((tc, i) => {
+          if (bals[i] === 0) return;
+          for (const t of Array.from(tc.getElementsByTagNameNS(W_NS, "t"))) {
+            const v = t.textContent || "";
+            if (!v.includes("{%")) continue;
+            t.textContent = v.replace(/\{%(-?)\s*(for|if|elif|else|endfor|endif)\b/g, "{%$1tr $2");
+          }
+        });
+      }
+    }
+
     // Tahap 2: Ekstrak tag kontrol docxtpl (tr, tc, p, r)
     const allT = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
     for (const t of allT) {

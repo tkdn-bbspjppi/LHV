@@ -12,6 +12,15 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
   const [loading, setLoading] = useState(true);
   const [dragState, setDragState] = useState(null);
   const overlayRef = React.useRef(null);
+  const resultRef = React.useRef(null);
+  const isImg = !!(file && file.type && file.type.startsWith('image/'));
+  // Ukuran lebar gambar di Word (mm). null = ikuti pengaturan layout otomatis.
+  const [widthMm, setWidthMm] = useState(
+    initialRects && initialRects[0] && initialRects[0].widthMm ? initialRects[0].widthMm : null
+  );
+  // Kunci rasio kotak crop: 'free' atau mis. '4:3'
+  const [ratio, setRatio] = useState('free');
+  const ratioValue = ratio === 'free' ? null : (() => { const [a, b] = ratio.split(':').map(Number); return a / b; })();
 
   function detectInitialCropRatio(canvas, formMode) {
     const ctx = canvas.getContext('2d');
@@ -80,9 +89,38 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
     let cancelled = false;
     (async () => {
       try {
+        const loaded = [];
+        if (isImg) {
+          // Gambar JPG/PNG: satu "halaman" berisi gambar utuh (sisi terpanjang dibatasi 4000px agar ringan)
+          const objUrl = URL.createObjectURL(file);
+          const img = await new Promise((res, rej) => {
+            const im = new Image();
+            im.onload = () => res(im);
+            im.onerror = () => rej(new Error('Gambar tidak dapat dibaca'));
+            im.src = objUrl;
+          });
+          URL.revokeObjectURL(objUrl);
+          const sc = Math.min(1, 4000 / Math.max(img.naturalWidth, img.naturalHeight));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(img.naturalWidth * sc));
+          canvas.height = Math.max(1, Math.round(img.naturalHeight * sc));
+          const cctx = canvas.getContext('2d');
+          cctx.fillStyle = '#ffffff';
+          cctx.fillRect(0, 0, canvas.width, canvas.height);
+          cctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const saved = initialRects && initialRects[0];
+          loaded.push({
+            pageNum: 1, canvas,
+            rect: saved ? { ...saved.rect } : { x: 0, y: 0, w: 1, h: 1 },
+            included: true,
+            url: canvas.toDataURL('image/jpeg', 0.92),
+            thumb: canvas.toDataURL('image/jpeg', 0.45),
+          });
+          if (!cancelled) { setPages(loaded); setLoading(false); }
+          return;
+        }
         const buf = await file.arrayBuffer();
         const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-        const loaded = [];
         for (let i = 1; i <= pdf.numPages; i++) {
           const page = await pdf.getPage(i);
           const viewport = page.getViewport({ scale: 2.0 });
@@ -101,7 +139,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
           setLoading(false);
         }
       } catch (err) {
-        alert('Gagal memuat pratinjau PDF: ' + err.message);
+        alert('Gagal memuat pratinjau: ' + err.message);
         onClose();
       }
     })();
@@ -149,6 +187,18 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
           r.h = Math.min(1 - r.y, Math.max(0.04, r.h + dy));
         }
       }
+      if (ratioValue && dragState.mode !== 'move') {
+        const cv = pages[activeIdx].canvas;
+        const o = dragState.origRect;
+        const origBottom = o.y + o.h;
+        const origRight = o.x + o.w;
+        let nh = (r.w * cv.width / ratioValue) / cv.height;
+        let ny = dragState.mode.includes('n') ? origBottom - nh : r.y;
+        if (ny < 0) { ny = 0; nh = origBottom; r.w = (nh * cv.height * ratioValue) / cv.width; }
+        if (ny + nh > 1) { nh = 1 - ny; r.w = (nh * cv.height * ratioValue) / cv.width; }
+        if (dragState.mode.includes('w')) r.x = origRight - r.w;
+        r.y = ny; r.h = nh;
+      }
       setPages((prev) => prev.map((p, idx) => (idx === activeIdx ? { ...p, rect: r } : p)));
     };
     const onUp = () => setDragState(null);
@@ -158,7 +208,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
-  }, [dragState, activeIdx]);
+  }, [dragState, activeIdx, ratioValue]);
 
   const applyRectToAll = () => {
     const cur = { ...pages[activeIdx].rect };
@@ -173,9 +223,45 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
     );
   };
 
+  const applyRatio = (key) => {
+    setRatio(key);
+    if (key === 'free' || !current) return;
+    const [a, b] = key.split(':').map(Number);
+    const t = a / b;
+    const c = current.canvas;
+    let wPx = c.width, hPx = wPx / t;
+    if (hPx > c.height) { hPx = c.height; wPx = hPx * t; }
+    const r = { w: wPx / c.width, h: hPx / c.height, x: 0, y: 0 };
+    r.x = (1 - r.w) / 2; r.y = (1 - r.h) / 2;
+    setPages((prev) => prev.map((p, idx) => (idx === activeIdx ? { ...p, rect: r } : p)));
+  };
+
+  const resetFull = () => {
+    setRatio('free');
+    setPages((prev) => prev.map((p, idx) => (idx === activeIdx ? { ...p, rect: { x: 0, y: 0, w: 1, h: 1 } } : p)));
+  };
+
+  // Pratinjau hasil potongan (langsung berubah saat kotak digeser)
+  useEffect(() => {
+    const cv = resultRef.current;
+    const cur = pages[activeIdx];
+    if (!cv || !cur) return;
+    const sx = Math.round(cur.rect.x * cur.canvas.width);
+    const sy = Math.round(cur.rect.y * cur.canvas.height);
+    const sw = Math.max(1, Math.round(cur.rect.w * cur.canvas.width));
+    const sh = Math.max(1, Math.round(cur.rect.h * cur.canvas.height));
+    const scale = Math.min(1, 240 / sw, 260 / sh);
+    cv.width = Math.max(1, Math.round(sw * scale));
+    cv.height = Math.max(1, Math.round(sh * scale));
+    const c2 = cv.getContext('2d');
+    c2.fillStyle = '#fff';
+    c2.fillRect(0, 0, cv.width, cv.height);
+    c2.drawImage(cur.canvas, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+  }, [pages, activeIdx, loading]);
+
   const handleSave = async () => {
     const blobs = [];
-    const rectMeta = pages.map((p) => ({ rect: { ...p.rect }, included: p.included }));
+    const rectMeta = pages.map((p) => ({ rect: { ...p.rect }, included: p.included, widthMm: widthMm || null }));
     for (const p of pages) {
       if (!p.included) continue;
       const sx = Math.round(p.rect.x * p.canvas.width);
@@ -217,7 +303,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
           backgroundColor: '#f8fafc'
         }}>
           <div>
-            <div style={{ fontWeight: 'bold', fontSize: '15px', color: '#0d47a1' }}>✂️ Pratinjau & Atur Potongan (Crop) Halaman PDF</div>
+            <div style={{ fontWeight: 'bold', fontSize: '15px', color: '#0d47a1' }}>✂️ Pratinjau & Atur Potongan (Crop) {isImg ? 'Gambar' : 'Halaman PDF'}</div>
             <div style={{ fontSize: '12px', color: '#666' }}>{file.name} — Geser kotak biru atau tarik 4 titik sudutnya agar pas mengikuti pola dokumen</div>
           </div>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -225,8 +311,16 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
               padding: '7px 12px', fontSize: '12px', backgroundColor: '#fff', color: '#555',
               border: '1px solid #ccc', borderRadius: '4px', cursor: 'pointer'
             }}>
-              🔄 Deteksi Ulang Halaman Ini
+              {isImg ? '🔄 Deteksi Otomatis Tepi' : '🔄 Deteksi Ulang Halaman Ini'}
             </button>
+            {isImg && (
+              <button type="button" onClick={resetFull} style={{
+                padding: '7px 12px', fontSize: '12px', backgroundColor: '#fff', color: '#555',
+                border: '1px solid #ccc', borderRadius: '4px', cursor: 'pointer'
+              }}>
+                ⛶ Gambar Utuh
+              </button>
+            )}
             {pages.length > 1 && (
               <button type="button" onClick={applyRectToAll} style={{
                 padding: '7px 12px', fontSize: '12px', backgroundColor: '#e3f2fd', color: '#1565c0',
@@ -239,7 +333,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
               padding: '8px 16px', fontSize: '12px', backgroundColor: '#2e7d32', color: '#fff',
               border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
             }}>
-              ✓ Simpan Potongan ({pages.filter((p) => p.included).length} Hal)
+              ✓ Simpan Potongan ({isImg ? '1 Gambar' : pages.filter((p) => p.included).length + ' Hal'})
             </button>
             <button type="button" onClick={onClose} style={{
               padding: '6px 10px', fontSize: '14px', backgroundColor: '#ffebee', color: '#c62828',
@@ -253,12 +347,12 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
         {/* Body Modal */}
         {loading ? (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#555', fontSize: '14px' }}>
-            ⏳ Merender halaman PDF untuk pratinjau...
+            ⏳ Memuat pratinjau...
           </div>
         ) : (
           <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-            {/* Sidebar Daftar Halaman */}
-            <div style={{
+            {/* Sidebar Daftar Halaman (hanya PDF) */}
+            {!isImg && <div style={{
               width: '175px', borderRight: '1px solid #ddd', backgroundColor: '#f1f5f9',
               overflowY: 'auto', padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px'
             }}>
@@ -290,7 +384,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
                   <img src={p.thumb} alt="" style={{ width: '100%', display: 'block', border: '1px solid #e2e8f0' }} />
                 </div>
               ))}
-            </div>
+            </div>}
 
             {/* Area Kanvas Utama */}
             <div style={{
@@ -344,6 +438,92 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
                 </div>
               )}
             </div>
+
+            {/* Panel Kanan: Hasil Potongan & Ukuran */}
+            <div style={{
+              width: '270px', borderLeft: '1px solid #ddd', backgroundColor: '#f8fafc',
+              overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '12px', fontSize: '12px'
+            }}>
+              <div>
+                <div style={{ fontWeight: 'bold', color: '#0d47a1', marginBottom: '6px' }}>👁️ Hasil Potongan</div>
+                <div style={{ backgroundColor: '#fff', border: '1px solid #cbd5e1', borderRadius: '4px', padding: '6px', textAlign: 'center' }}>
+                  <canvas ref={resultRef} style={{ maxWidth: '100%', border: '1px solid #e2e8f0' }} />
+                </div>
+                {current && (() => {
+                  const pw = Math.round(current.rect.w * current.canvas.width);
+                  const ph = Math.round(current.rect.h * current.canvas.height);
+                  const wCm = widthMm ? widthMm / 10 : null;
+                  return (
+                    <div style={{ marginTop: '6px', color: '#555', lineHeight: 1.5 }}>
+                      Piksel hasil: <strong>{pw} × {ph}</strong><br />
+                      {wCm
+                        ? <>Di Word: <strong>{wCm.toFixed(1)} × {(wCm * ph / pw).toFixed(1)} cm</strong></>
+                        : <>Di Word: <strong>ukuran otomatis</strong> (ikut pengaturan layout)</>}
+                    </div>
+                  );
+                })()}
+              </div>
+
+              <div>
+                <div style={{ fontWeight: 'bold', color: '#0d47a1', marginBottom: '6px' }}>📏 Lebar di Dokumen Word</div>
+                <select
+                  value={[45, 70, 100, 130, 165].includes(widthMm) ? String(widthMm) : (widthMm ? 'custom' : 'auto')}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === 'auto') setWidthMm(null);
+                    else if (v === 'custom') setWidthMm(widthMm || 80);
+                    else setWidthMm(Number(v));
+                  }}
+                  style={{ width: '100%', padding: '6px', fontSize: '12px', border: '1px solid #ccc', borderRadius: '4px' }}
+                >
+                  <option value="auto">Otomatis (ikut layout)</option>
+                  <option value="45">Kecil — 4,5 cm</option>
+                  <option value="70">Sedang — 7 cm</option>
+                  <option value="100">Besar — 10 cm</option>
+                  <option value="130">Sangat besar — 13 cm</option>
+                  <option value="165">Lebar penuh — 16,5 cm</option>
+                  <option value="custom">Atur sendiri…</option>
+                </select>
+                {widthMm && ![45, 70, 100, 130, 165].includes(widthMm) && (
+                  <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <input
+                      type="number" min="2" max="17" step="0.5"
+                      value={(widthMm / 10).toString()}
+                      onChange={(e) => {
+                        const cm = parseFloat(e.target.value);
+                        if (!isNaN(cm)) setWidthMm(Math.min(170, Math.max(20, Math.round(cm * 10))));
+                      }}
+                      style={{ width: '80px', padding: '5px', fontSize: '12px', border: '1px solid #ccc', borderRadius: '4px' }}
+                    />
+                    <span>cm (2 – 17)</span>
+                  </div>
+                )}
+                <div style={{ marginTop: '4px', color: '#888', fontSize: '11px' }}>
+                  Berlaku untuk semua halaman dari berkas ini.
+                </div>
+              </div>
+
+              <div>
+                <div style={{ fontWeight: 'bold', color: '#0d47a1', marginBottom: '6px' }}>🔒 Rasio Kotak Crop</div>
+                <select
+                  value={ratio}
+                  onChange={(e) => applyRatio(e.target.value)}
+                  style={{ width: '100%', padding: '6px', fontSize: '12px', border: '1px solid #ccc', borderRadius: '4px' }}
+                >
+                  <option value="free">Bebas</option>
+                  <option value="1:1">1 : 1 (persegi)</option>
+                  <option value="4:3">4 : 3 (landscape)</option>
+                  <option value="3:2">3 : 2 (landscape)</option>
+                  <option value="16:9">16 : 9 (lebar)</option>
+                  <option value="3:4">3 : 4 (potret)</option>
+                  <option value="2:3">2 : 3 (potret)</option>
+                  <option value="9:16">9 : 16 (tinggi)</option>
+                </select>
+                <div style={{ marginTop: '4px', color: '#888', fontSize: '11px' }}>
+                  Rasio terkunci saat menarik sudut kotak.
+                </div>
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -354,7 +534,7 @@ function PdfCropModal({ file, initialRects, isFormulir, onSave, onClose }) {
 // ==========================================
 // KOMPONEN HELPER: PRATINJAU DOKUMEN KECIL DENGAN INFO TARGET & TOMBOL CROP PDF
 // ==========================================
-function ImagePreview({ file, targetWidth, uniform, customBlobs, onOpenCrop }) {
+function ImagePreview({ file, targetWidth, uniform, customBlobs, cropRects, onOpenCrop }) {
   const [url, setUrl] = useState('');
 
   useEffect(() => {
@@ -370,8 +550,12 @@ function ImagePreview({ file, targetWidth, uniform, customBlobs, onOpenCrop }) {
 
   if (!file) return null;
 
+  const customWidthMm = cropRects && cropRects[0] && cropRects[0].widthMm ? cropRects[0].widthMm : null;
+  const effectiveWidth = customWidthMm ? `${(customWidthMm / 10).toFixed(1).replace('.0', '')} cm` : targetWidth;
+
   // Jika file adalah gambar (PNG/JPG)
   if (file.type.startsWith('image/')) {
+    const hasCustomImg = Array.isArray(customBlobs) && customBlobs.length > 0;
     return (
       <div style={{ marginTop: '10px' }}>
         <div style={{
@@ -398,8 +582,21 @@ function ImagePreview({ file, targetWidth, uniform, customBlobs, onOpenCrop }) {
           />
         </div>
         <span style={{ fontSize: '11px', color: uniform ? '#2e7d32' : '#1565c0', display: 'block', marginTop: '5px', fontWeight: 'bold' }}>
-          {uniform ? `📐 Proporsional otomatis (tanpa kotak persegi paksa) — lebar: ${targetWidth}` : `↔️ Output Word dikunci: ${targetWidth}`}
+          {hasCustomImg ? `✂️ Sudah di-crop — lebar di Word: ${effectiveWidth}` : (uniform ? `📐 Proporsional otomatis (tanpa kotak persegi paksa) — lebar: ${effectiveWidth}` : `↔️ Output Word dikunci: ${effectiveWidth}`)}
         </span>
+        {onOpenCrop && (
+          <button
+            type="button"
+            onClick={onOpenCrop}
+            style={{
+              marginTop: '6px', padding: '6px 10px', fontSize: '11px', fontWeight: 'bold',
+              backgroundColor: hasCustomImg ? '#2e7d32' : '#1976d2', color: '#fff',
+              border: 'none', borderRadius: '4px', cursor: 'pointer', whiteSpace: 'nowrap'
+            }}
+          >
+            {hasCustomImg ? '✏️ Ubah Crop & Ukuran' : '✂️ Pratinjau, Crop & Ukuran'}
+          </button>
+        )}
       </div>
     );
   }
@@ -443,7 +640,7 @@ function ImagePreview({ file, targetWidth, uniform, customBlobs, onOpenCrop }) {
         {hasCustom && url && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#fff', padding: '5px', borderRadius: '4px', border: '1px solid #c8e6c9' }}>
             <img src={url} alt="Hasil Crop" style={{ maxHeight: '64px', maxWidth: '90px', objectFit: 'contain', border: '1px solid #eee' }} />
-            <span style={{ fontSize: '11px', color: '#2e7d32' }}>Pratinjau halaman 1 hasil crop • Target Word: <strong>{targetWidth}</strong></span>
+            <span style={{ fontSize: '11px', color: '#2e7d32' }}>Pratinjau halaman 1 hasil crop • Target Word: <strong>{effectiveWidth}</strong></span>
           </div>
         )}
       </div>
@@ -920,6 +1117,7 @@ function App() {
     rekapBahanBaku, modeRekapBahanBaku,
     fileRekapBahanBaku,
     customBlobsRekap: customBlobsSingle.rekapBahanBaku?.blobs || null,
+    widthOverrides: Object.fromEntries(Object.entries(customBlobsSingle || {}).map(([k, v]) => [k, v && v.rectMeta && v.rectMeta[0] ? v.rectMeta[0].widthMm || null : null])),
     layoutGambar, acuanPeraturan, samaDenganKantor,
     fileCover, fileLogo, fileTtdVerifikator,
     fileStruktur, customBlobsStruktur: customBlobsSingle.struktur?.blobs || null,
@@ -931,7 +1129,8 @@ function App() {
           id: 1,
           judul: 'Formulir Verifikasi (Dokumen Gabungan)',
           file: fileFormulirGabungan,
-          customBlobs: customBlobsSingle.formulirGabungan?.blobs || null
+          customBlobs: customBlobsSingle.formulirGabungan?.blobs || null,
+          cropRects: customBlobsSingle.formulirGabungan?.rectMeta || null
         }]
       : formulirVerifikasi,
     fileBuktiPabrik, fileBom, fileSertifikatTkdn, fileBuktiBeli, fileKtp,
@@ -1212,6 +1411,7 @@ function App() {
             targetWidth="7 cm"
             uniform={true}
             customBlobs={item.customBlobs}
+            cropRects={item.cropRects}
             onOpenCrop={() => setCropModal({
               file: item.file,
               isFormulir: false,
@@ -1654,6 +1854,7 @@ function App() {
                   file={fileFormulirGabungan}
                   targetWidth="16,5 cm (penuh lebar)"
                   customBlobs={customBlobsSingle.formulirGabungan?.blobs}
+                    cropRects={customBlobsSingle.formulirGabungan?.rectMeta}
                   onOpenCrop={() => setCropModal({
                     file: fileFormulirGabungan,
                     isFormulir: true,
@@ -1700,6 +1901,7 @@ function App() {
                         file={form.file}
                         targetWidth="16,5 cm (penuh lebar)"
                         customBlobs={form.customBlobs}
+                        cropRects={form.cropRects}
                         onOpenCrop={() => setCropModal({
                           file: form.file,
                           isFormulir: true,
@@ -1803,6 +2005,7 @@ function App() {
                     file={fileStruktur}
                     targetWidth="7 cm"
                     customBlobs={customBlobsSingle.struktur?.blobs}
+                    cropRects={customBlobsSingle.struktur?.rectMeta}
                     onOpenCrop={() => setCropModal({
                       file: fileStruktur,
                       isFormulir: false,
@@ -1858,6 +2061,7 @@ function App() {
                         file={fileStruktur}
                         targetWidth="7 cm"
                         customBlobs={customBlobsSingle.struktur?.blobs}
+                    cropRects={customBlobsSingle.struktur?.rectMeta}
                         onOpenCrop={() => setCropModal({
                           file: fileStruktur,
                           isFormulir: false,
@@ -1908,6 +2112,7 @@ function App() {
                         file={fileStrukturIndustri}
                         targetWidth="7 cm"
                         customBlobs={customBlobsSingle.strukturIndustri?.blobs}
+                    cropRects={customBlobsSingle.strukturIndustri?.rectMeta}
                         onOpenCrop={() => setCropModal({
                           file: fileStrukturIndustri,
                           isFormulir: false,
@@ -1929,6 +2134,7 @@ function App() {
                         file={fileAlurProduksi}
                         targetWidth="7 cm"
                         customBlobs={customBlobsSingle.alurProduksi?.blobs}
+                    cropRects={customBlobsSingle.alurProduksi?.rectMeta}
                         onOpenCrop={() => setCropModal({
                           file: fileAlurProduksi,
                           isFormulir: false,
@@ -2008,6 +2214,7 @@ function App() {
                         file={fileStruktur}
                         targetWidth="7 cm"
                         customBlobs={customBlobsSingle.struktur?.blobs}
+                    cropRects={customBlobsSingle.struktur?.rectMeta}
                         onOpenCrop={() => setCropModal({
                           file: fileStruktur,
                           isFormulir: false,
@@ -2029,6 +2236,7 @@ function App() {
                         file={fileAlurProduksi}
                         targetWidth="7 cm"
                         customBlobs={customBlobsSingle.alurProduksi?.blobs}
+                    cropRects={customBlobsSingle.alurProduksi?.rectMeta}
                         onOpenCrop={() => setCropModal({
                           file: fileAlurProduksi,
                           isFormulir: false,
@@ -2132,6 +2340,7 @@ function App() {
                       file={fileRekapBahanBaku}
                       targetWidth="Lebar penuh tabel (16,5 cm)"
                       customBlobs={customBlobsSingle.rekapBahanBaku?.blobs}
+                    cropRects={customBlobsSingle.rekapBahanBaku?.rectMeta}
                       onOpenCrop={() => setCropModal({
                         file: fileRekapBahanBaku,
                         isFormulir: true,

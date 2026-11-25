@@ -267,9 +267,11 @@
     return token;
   }
 
-  async function buildDynamicList(list, widthMm, shape, imageJobs, tick) {
+  async function buildDynamicList(list, defaultWidthMm, shape, imageJobs, tick) {
     const result = [];
     for (const item of list || []) {
+      // Ukuran khusus dari modal crop (cropRects[0].widthMm) menggantikan lebar bawaan layout
+      const widthMm = (item.cropRects && item.cropRects[0] && item.cropRects[0].widthMm) || defaultWidthMm;
       const hasCustom = Array.isArray(item.customBlobs) && item.customBlobs.length > 0;
       if (!item.file && !hasCustom) continue;
       const keterangan = shape === "formulir" ? item.judul || "" : item.keterangan || "";
@@ -447,13 +449,13 @@
     const logoToken = await processSingleImage(state.fileLogo, null, 20, imageJobs, "logo", tick);
     const ttdToken = await processSingleImage(state.fileTtdVerifikator, null, 20, imageJobs, "ttd", tick);
     const strukturToken = await processSingleImage(
-      state.fileStruktur, state.customBlobsStruktur, 70, imageJobs, "struktur", tick
+      state.fileStruktur, state.customBlobsStruktur, (state.widthOverrides && state.widthOverrides.struktur) || 70, imageJobs, "struktur", tick
     );
     const alurToken = await processSingleImage(
-      state.fileAlurProduksi, state.customBlobsAlurProduksi, 70, imageJobs, "alur", tick
+      state.fileAlurProduksi, state.customBlobsAlurProduksi, (state.widthOverrides && state.widthOverrides.alurProduksi) || 70, imageJobs, "alur", tick
     );
     const strukturIndustriToken = await processSingleImage(
-      state.fileStrukturIndustri, state.customBlobsStrukturIndustri, 70, imageJobs, "struktur_ind", tick
+      state.fileStrukturIndustri, state.customBlobsStrukturIndustri, (state.widthOverrides && state.widthOverrides.strukturIndustri) || 70, imageJobs, "struktur_ind", tick
     );
     const coverToken = await processSingleImage(state.fileCover, null, 210, imageJobs, "cover", tick, 297);
     const fotoBarangToken = await processSingleImage(state.fileFotoBarang, null, 70, imageJobs, "foto_barang", tick);
@@ -497,7 +499,7 @@
       tick("Memproses dokumen rekapitulasi bahan baku...");
       const rekapList = await buildDynamicList(
         [{ file: state.fileRekapBahanBaku, customBlobs: state.customBlobsRekap, keterangan: "" }],
-        165,
+        (state.widthOverrides && state.widthOverrides.rekapBahanBaku) || 165,
         "formulir",
         imageJobs,
         tick

@@ -461,11 +461,13 @@
     step("Memproses cover, logo & gambar utama...");
 
     const dynamicContext = {};
+    const flatContext = {}; // daftar datar {judul, keterangan, gambar} per kategori (untuk template yang mem-batch sendiri)
     for (const [stateKey, tplKey, widthMm, shape, groupTwo] of CATEGORY_CONFIG) {
       const list = state[stateKey] || [];
       const hasFile = list.some((it) => it && (it.file || (it.customBlobs && it.customBlobs.length > 0)));
       const effectiveWidth = shape === "std" ? stdWidthMm : widthMm;
       const built = await buildDynamicList(list, effectiveWidth, shape, imageJobs, tick);
+      flatContext[tplKey] = built;
       dynamicContext[tplKey] = groupTwo ? groupIntoRows(built, perBaris) : built;
       if (hasFile) step(`Memproses ${tplKey}...`);
     }
@@ -503,9 +505,50 @@
       rekapToken = rekapList.map((r) => r.gambar).join(" ");
     }
 
+    // ---- Alias nama variabel untuk template gaya lama (mis. template_lhv_produksi_sendiri.docx) ----
+    // Template tsb mem-batch sendiri: {% for baris in xxx | batch(2, None) %} + baris[0].gambar / baris[1].gambar.
+    // Untuk layout "1 foto per baris", sisipkan null setelah tiap item agar tiap batch hanya berisi 1 foto.
+    const forBatch = (list) => {
+      if (perBaris !== 1) return list;
+      const out = [];
+      list.forEach((it) => { out.push(it, null); });
+      return out;
+    };
+    const BATCHED_ALIASES = {
+      akta_perusahaan: "list_akta_pendirian", akta_sewa: "list_akta_sewa", bpom: "list_bpom",
+      bukti_beli: "list_bukti_beli", bukti_listrik: "list_bukti_listrik", bukti_pabrik: "list_bukti_pabrik",
+      daftar_gaji: "list_daftar_gaji", daftar_penyusutan: "list_daftar_penyusutan",
+      foto_bahan_baku: "list_foto_bahan_baku", foto_mesin: "list_foto_mesin", gambar_bom: "list_bom",
+      geotagging: "list_geotagging", invoice_bahan_baku: "list_invoice_bahan_baku",
+      izin_usaha: "list_izin_usaha", ktp_karyawan: "list_ktp", nib_rba: "list_nib_rba", nie: "list_nie",
+      sampel_ktp: "list_sampel_ktp", sert_merek: "list_sert_merek", sert_produk: "list_sert_produk",
+      sert_standar: "list_sertifikat_standar", sertifikat_tkdn: "list_sertifikat_tkdn",
+    };
+    const FLAT_ALIASES = {
+      alur_proses_lampiran: "list_alur_proses_lampiran", npwp_lampiran: "list_npwp_lampiran",
+      struktur_pabrik: "list_struktur_pabrik", formulir_tkdn: "list_formulir",
+    };
+    const aliasContext = {};
+    for (const [alias, key] of Object.entries(BATCHED_ALIASES)) aliasContext[alias] = forBatch(flatContext[key] || []);
+    for (const [alias, key] of Object.entries(FLAT_ALIASES)) aliasContext[alias] = flatContext[key] || [];
+
+    // "foto_produk" dipakai template sebagai gambar tunggal ({{ foto_produk }}) SEKALIGUS daftar ({% for ... in foto_produk %}):
+    // daftar yang bila dicetak langsung menghasilkan token gambar utama.
+    const fotoProdukSingle = fotoProdukUtamaToken || (flatContext.list_foto_produk?.[0]?.gambar || "");
+    const fotoProdukList = forBatch(flatContext.list_foto_produk || []).slice();
+    Object.defineProperty(fotoProdukList, "toString", { value: () => fotoProdukSingle, enumerable: false });
+    aliasContext.foto_produk = fotoProdukList;
+
     const noLhv = buildNoLhv(state);
     const context = {
+      ...aliasContext,
       ...dynamicContext,
+      ...aliasContext,
+      cover_laporan: coverToken,
+      struktur_organisasi: strukturToken,
+      alur_produksi: alurToken,
+      tanggal_dibuat: formatTanggalIndo(state.tanggalLhv),
+      daftar_acuan_peraturan: acuanFiltered.map((a) => ({ aturan: a })),
       no_lhv: noLhv,
       nama_perusahaan: state.namaPerusahaan || "",
       tanggal_lhv: formatTanggalIndo(state.tanggalLhv),
@@ -576,7 +619,8 @@
       gambar_struktur_industri: strukturIndustriToken,
       gambar_cover: coverToken,
       foto_barang: fotoBarangToken,
-      foto_produk: fotoProdukUtamaToken || (dynamicContext.list_foto_produk?.[0]?.gambar_1 || ""),
+      // foto_produk: lihat aliasContext (daftar dengan toString = token gambar utama)
+      foto_produk_utama: fotoProdukSingle,
     };
 
     step("Menyusun dokumen Word (.docx)...");

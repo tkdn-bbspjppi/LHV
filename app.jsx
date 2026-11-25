@@ -1125,6 +1125,7 @@ function App() {
       bidangUsaha: kbliDeskripsi,
       namaProduk: jenisBarang,
       fotoProdukBlob: fileFotoCover,
+      tahun: (String(tanggalLhv || '').split('-')[0] || '').match(/^\d{4}$/) ? String(tanggalLhv).split('-')[0] : String(new Date().getFullYear()),
     };
   };
 

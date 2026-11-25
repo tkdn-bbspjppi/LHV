@@ -212,6 +212,46 @@
       }
     }
 
+    // Tahap 1b: {% for/if %} dan {% endfor/endif %} yang terpisah di sel (tc) berbeda dalam SATU baris
+    // (mis. loop tabel rekap tanpa penanda "tr") diangkat ke level baris, supaya tabel tidak rusak.
+    {
+      const CTRL_RE = /\{%-?\s*(for|if|endfor|endif)\b[\s\S]*?-?%\}/g;
+      for (const tr of Array.from(doc.getElementsByTagNameNS(W_NS, "tr"))) {
+        const tcs = Array.from(tr.childNodes).filter((n) => n.localName === "tc" && n.namespaceURI === W_NS);
+        const openers = [];
+        const closers = [];
+        for (const tc of tcs) {
+          const stack = [];
+          for (const t of Array.from(tc.getElementsByTagNameNS(W_NS, "t"))) {
+            const txt = t.textContent || "";
+            CTRL_RE.lastIndex = 0;
+            let m;
+            while ((m = CTRL_RE.exec(txt))) {
+              const item = { t, start: m.index, end: m.index + m[0].length, text: m[0] };
+              if (m[1] === "for" || m[1] === "if") stack.push(item);
+              else if (stack.length) stack.pop();
+              else closers.push(item);
+            }
+          }
+          openers.push(...stack);
+        }
+        if (openers.length === 0 || openers.length !== closers.length) continue;
+
+        const all = [...openers, ...closers].sort((a, b) => (a.t === b.t ? b.start - a.start : 0));
+        for (const it of all) {
+          const cur = it.t.textContent || "";
+          it.t.textContent = cur.slice(0, it.start) + cur.slice(it.end);
+        }
+        for (const it of openers) {
+          tr.parentNode.insertBefore(doc.createTextNode(it.text.replace(/\s+/g, " ")), tr);
+        }
+        const ref = tr.nextSibling;
+        for (const it of closers) {
+          tr.parentNode.insertBefore(doc.createTextNode(it.text.replace(/\s+/g, " ")), ref);
+        }
+      }
+    }
+
     // Tahap 2: Ekstrak tag kontrol docxtpl (tr, tc, p, r)
     const allT = Array.from(doc.getElementsByTagNameNS(W_NS, "t"));
     for (const t of allT) {
@@ -274,7 +314,7 @@
     for (const p of paragraphsAfter) {
       const tNodes = Array.from(p.getElementsByTagNameNS(W_NS, "t"));
       const fullText = cleanText(tNodes.map((t) => t.textContent || "").join("")).trim();
-      if (fullText && /^(?:\{%-?[\s\S]*?-?%\}\s*)+$/.test(fullText)) {
+      if (fullText && /^(?:\{%(?:(?!%\})[\s\S])*%\}\s*)+$/.test(fullText)) {
         p.parentNode.replaceChild(doc.createTextNode(fullText), p);
       }
     }
@@ -329,7 +369,14 @@
       if (val.startsWith("§§RAW:")) return val.slice(6);
       return escapeXml(val).replace(/\r?\n/g, "§§BR§§");
     }
-    if (Array.isArray(val)) return val.map(escapeContext);
+    if (Array.isArray(val)) {
+      const out = val.map(escapeContext);
+      if (Object.prototype.hasOwnProperty.call(val, "toString")) {
+        const str = escapeContext(val.toString());
+        Object.defineProperty(out, "toString", { value: () => str, enumerable: false });
+      }
+      return out;
+    }
     if (typeof val === "object") {
       const out = {};
       for (const k of Object.keys(val)) out[k] = escapeContext(val[k]);
@@ -650,7 +697,9 @@
         addedExts,
         rekapXml
       );
-      zip.file(xmlPath, XML_DECL + finalized, { createFolders: false });
+      // XMLSerializer di browser bisa sudah menyertakan deklarasi sendiri -> pastikan hanya ada satu
+      const finalizedBody = finalized.replace(/^\s*<\?xml[^>]*\?>\s*/, "");
+      zip.file(xmlPath, XML_DECL + finalizedBody, { createFolders: false });
       if (jobs._newRels.length > 0) newRelsByPart[xmlPath] = jobs._newRels.slice();
     }
 

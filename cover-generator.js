@@ -261,6 +261,7 @@
       bidangUsaha,
       namaProduk,
       fotoProdukBlob,
+      tahun,
     } = opts;
 
     const cat = CATEGORIES[categoryKey] || CATEGORIES.tkdn_sendiri;
@@ -347,10 +348,15 @@
     //    kontras di atas template apa pun (tidak bergantung pada gambar
     //    badge yang mungkin/tidak ada di file PNG template).
     if (posCfg.tahun) {
+      // Prioritas: opts.tahun (dari Tanggal LHV) -> tahun dari No. LHV (kelompok 4 digit TERAKHIR,
+      // bukan yang pertama: bagian pertama No. LHV adalah ID Berkas, mis. "2312") -> tahun berjalan.
       let displayYear = new Date().getFullYear().toString();
-      if (noLhv) {
-        const matchYear = noLhv.match(/\d{4}/);
-        if (matchYear) displayYear = matchYear[0];
+      const tahunOpt = String(tahun == null ? '' : tahun).match(/^\d{4}$/);
+      if (tahunOpt) {
+        displayYear = tahunOpt[0];
+      } else if (noLhv) {
+        const all = String(noLhv).match(/(?<!\d)\d{4}(?!\d)/g);
+        if (all && all.length) displayYear = all[all.length - 1];
       }
       const t = posCfg.tahun;
       ctx.font = `${t.weight} ${t.fontSize}px ${FONT_FAMILY}`;

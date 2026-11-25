@@ -864,7 +864,7 @@ function App() {
     { id: 5, type: 'fixed', aturan: 'Keputusan Kepala Badan Standardisasi dan Kebijakan Jasa Industri Tahun 2026 tentang Pedoman Penyelenggaraan Layanan Penghitungan dan Verifikasi Nilai Tingkat Komponen Dalam Negeri dan Bobot Manfaat Perusahaan di Lingkungan Badan Standardisasi dan Kebijakan Jasa Industri' },
     { id: 6, type: 'dropdown', aturan: 'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri', options: [
       'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
-      'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Kementerian Perindustrian Nomor 4 Tahun 2026 tentang Perubahan Ketiga atas Peraturan Dirjen ILMATE Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
+      'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Kementerian Perindustrian Nomor 4 Tahun 2026 tentang Perubahan Kedua atas Peraturan Dirjen ILMATE Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
       'Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 186 Tahun 2026 tentang Perubahan Kedua atas Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 263 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKMA untuk Penghitungan TKDN',
       'Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 23 Tahun 2026 tentang Perubahan Ketiga atas Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKFT untuk Penghitungan Nilai TKDN',
       'Peraturan Direktur Jenderal Industri Agro Nomor 4 Tahun 2026 tentang Perubahan Kedua atas Peraturan Direktur Jenderal Industri Agro Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Agro untuk Penghitungan Nilai TKDN'
@@ -1196,7 +1196,25 @@ function App() {
         if (rec && rec.state) {
           const d = rec.state;
           Object.keys(allSetters).forEach((key) => {
-            if (d[key] !== undefined && d[key] !== null) allSetters[key](d[key]);
+            if (d[key] === undefined || d[key] === null) return;
+            if (key === 'acuanPeraturan' && Array.isArray(d[key])) {
+              // Teks regulasi & daftar pilihan dropdown SELALU diambil dari kode terbaru (app.jsx),
+              // bukan dari draft lama di browser. Dari draft hanya dipulihkan: pilihan dropdown
+              // (jika masih ada di daftar baru) dan butir acuan tambahan yang ditambah manual.
+              const saved = d[key];
+              setAcuanPeraturan((defaults) => {
+                const merged = defaults.map((def) => {
+                  if (def.type !== 'dropdown') return def;
+                  const sv = saved.find((x) => x && x.id === def.id);
+                  const keep = sv && Array.isArray(def.options) && def.options.includes(sv.aturan);
+                  return keep ? { ...def, aturan: sv.aturan } : def;
+                });
+                const extras = saved.filter((x) => x && x.type === 'dynamic');
+                return [...merged, ...extras];
+              });
+              return;
+            }
+            allSetters[key](d[key]);
           });
           if (d.permenperin) loadedPermenperin = d.permenperin;
           if (Array.isArray(d.formulirVerifikasiList) && d.formulirVerifikasiList.length > 0) {

@@ -227,6 +227,32 @@
       }
     }
 
+    // Tahap 1a: kolom "No" kosong pada baris perulangan (sel pertama hanya berisi tag for/if,
+    // baris di atasnya berjudul "No") -> isi nomor urut otomatis dengan {{ loop.index }}.
+    for (const tr of Array.from(doc.getElementsByTagNameNS(W_NS, "tr"))) {
+      const tcs = Array.from(tr.childNodes).filter((n) => n.localName === "tc" && n.namespaceURI === W_NS);
+      if (tcs.length < 2) continue;
+      const rowText = tcs.map((tc) =>
+        Array.from(tc.getElementsByTagNameNS(W_NS, "t")).map((t) => t.textContent || "").join("")
+      );
+      if (!/\{%-?\s*(?:tr\s+)?for\b/.test(rowText.join(""))) continue;
+      const prev = tr.previousSibling && tr.previousSibling.nodeType === 1 ? tr.previousSibling : null;
+      const prevFirstTc = prev && prev.localName === "tr"
+        ? Array.from(prev.childNodes).find((n) => n.localName === "tc" && n.namespaceURI === W_NS)
+        : null;
+      const prevFirst = prevFirstTc
+        ? Array.from(prevFirstTc.getElementsByTagNameNS(W_NS, "t")).map((t) => t.textContent || "").join("").trim()
+        : "";
+      if (!/^no\.?$/i.test(prevFirst)) continue;
+      if (rowText[0].replace(/\{%[\s\S]*?%\}/g, "").trim() !== "") continue;
+      const ts = Array.from(tcs[0].getElementsByTagNameNS(W_NS, "t"));
+      const last = ts[ts.length - 1];
+      if (last) {
+        last.textContent = (last.textContent || "") + "{{ loop.index }}";
+        last.setAttribute("xml:space", "preserve");
+      }
+    }
+
     // Tahap 1b: {% for/if %} dan {% endfor/endif %} yang terpisah di sel (tc) berbeda dalam SATU baris
     // (mis. loop tabel rekap tanpa penanda "tr") diangkat ke level baris, supaya tabel tidak rusak.
     {

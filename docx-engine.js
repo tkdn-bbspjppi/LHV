@@ -201,9 +201,24 @@
         continue;
       }
 
-      const normalized = fullText.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) =>
+      let normalized = fullText.replace(/(\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\})/g, (tag) =>
         normalizeJinjaExpression(tag)
       );
+
+      // Label "Keterangan:" di depan tag keterangan dibuang: yang tercetak langsung isinya
+      // (mis. "IMB dan Sertifikat", bukan "Keterangan: IMB dan Sertifikat").
+      normalized = normalized.replace(
+        /Keterangan\s*:\s*(\{\{\s*[\w\[\]\.]*keterangan[\w\[\]\.]*\s*\}\})/gi,
+        "$1"
+      );
+
+      // Paragraf yang isinya HANYA tag keterangan: tampilkan hanya jika keterangannya terisi,
+      // supaya tidak tersisa baris kosong ketika pengguna memilih tanpa keterangan.
+      const capOnly = normalized.trim().match(/^\{\{\s*([\w\[\]\.]*keterangan[\w\[\]\.]*)\s*\}\}$/i);
+      if (capOnly) {
+        p.parentNode.insertBefore(doc.createTextNode(`{% if ${capOnly[1]} %}`), p);
+        p.parentNode.insertBefore(doc.createTextNode(`{% endif %}`), p.nextSibling);
+      }
 
       tNodes[0].textContent = normalized;
       tNodes[0].setAttribute("xml:space", "preserve");

@@ -1,4 +1,5 @@
 const { useState, useEffect } = React;
+console.log('[LHV] app.jsx versi 2026-11-26 (keterangan opsional) dimuat');
 // Logo dimuat dari folder assets/ (statis, tidak perlu bundler)
 const logoKemenperin = 'assets/logo-kemenperin.png';
 const logoBBS = 'assets/logo-bbspjppi.png';
@@ -863,7 +864,6 @@ function App() {
     { id: 4, type: 'fixed', aturan: 'Peraturan Sekretaris Jenderal Kementerian Perindustrian Nomor 5 Tahun 2025 tentang Petunjuk Teknis Penghitungan Nilai TKDN Barang dan Jasa Industri' },
     { id: 5, type: 'fixed', aturan: 'Keputusan Kepala Badan Standardisasi dan Kebijakan Jasa Industri Tahun 2026 tentang Pedoman Penyelenggaraan Layanan Penghitungan dan Verifikasi Nilai Tingkat Komponen Dalam Negeri dan Bobot Manfaat Perusahaan di Lingkungan Badan Standardisasi dan Kebijakan Jasa Industri' },
     { id: 6, type: 'dropdown', aturan: 'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 4 Tahun 2026 tentang Perubahan Kedua atas Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri', options: [
-      'Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 4 Tahun 2026 tentang Perubahan Kedua atas Peraturan Direktur Jenderal Industri Logam, Mesin, Alat Transportasi dan Elektronika Nomor 6 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Industri Logam, Mesin, Alat Transportasi dan Elektronika untuk Penghitungan Nilai Tingkat Komponen Dalam Negeri',
       'Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 186 Tahun 2026 tentang Perubahan Kedua atas Peraturan Direktur Jenderal Industri Kecil, Menengah, dan Aneka Nomor 263 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKMA untuk Penghitungan TKDN',
       'Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 23 Tahun 2026 tentang Perubahan Ketiga atas Peraturan Direktur Jenderal Industri Kimia, Farmasi dan Tekstil Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor IKFT untuk Penghitungan Nilai TKDN',
       'Peraturan Direktur Jenderal Industri Agro Nomor 4 Tahun 2026 tentang Perubahan Kedua atas Peraturan Direktur Jenderal Industri Agro Nomor 1 Tahun 2025 tentang Rincian Komponen Utama Barang Sektor Agro untuk Penghitungan Nilai TKDN'
@@ -1255,7 +1255,9 @@ function App() {
     }
   };
 
-  const addDynamic = (state, setState) => setState([...state, { id: Date.now(), file: null, keterangan: '' }]);
+  const addDynamic = (state, setState) => setState([...state, { id: Date.now(), file: null, keterangan: '', tanpaKeterangan: !!(state[0] && state[0].tanpaKeterangan) }]);
+  // Pilihan "tulis keterangan?" berlaku untuk seluruh dokumen dalam satu blok
+  const setTanpaKeterangan = (setState, off) => setState((prev) => prev.map((it) => ({ ...it, tanpaKeterangan: off })));
   const removeDynamic = (state, setState, id) => setState(state.filter(item => item.id !== id));
   const updateDynamic = (state, setState, id, field, value) =>
     setState(state.map(item =>
@@ -1414,11 +1416,23 @@ function App() {
   // Render Blok Dinamis dengan penyematan ImagePreview + Tombol Crop PDF
   const renderDynamicBlock = (title, state, setState) => (
     <div style={{ ...sectionStyle, backgroundColor: '#fff' }}>
-      <h4 style={{ margin: '0 0 10px 0', color: '#1976d2' }}>{title}</h4>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap', margin: '0 0 10px 0' }}>
+        <h4 style={{ margin: 0, color: '#1976d2' }}>{title}</h4>
+        <label style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: '#555', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={!(state.length > 0 && state.every((it) => it.tanpaKeterangan))}
+            onChange={(e) => setTanpaKeterangan(setState, !e.target.checked)}
+          />
+          Tulis keterangan di LHV
+        </label>
+      </div>
       {state.map((item, index) => (
         <div key={item.id} style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '12px', paddingBottom: '12px', borderBottom: '1px dashed #eee' }}>
           <div style={{ display: 'flex', gap: '10px' }}>
-            <input type="text" value={item.keterangan} onChange={(e) => updateDynamic(state, setState, item.id, 'keterangan', e.target.value)} placeholder={`Keterangan ${index + 1}`} style={inputStyle} />
+            {item.tanpaKeterangan
+              ? <div style={{ ...inputStyle, display: 'flex', alignItems: 'center', color: '#999', backgroundColor: '#f5f5f5', fontSize: '12px' }}>Tanpa keterangan (centang "Tulis keterangan di LHV" untuk mengisi)</div>
+              : <input type="text" value={item.keterangan} onChange={(e) => updateDynamic(state, setState, item.id, 'keterangan', e.target.value)} placeholder={`Keterangan ${index + 1}`} style={inputStyle} />}
             <input type="file" accept="image/png, image/jpeg, application/pdf" onChange={(e) => updateDynamic(state, setState, item.id, 'file', e.target.files[0])} style={{ alignSelf: 'center', marginTop: '6px' }} />
             <GDriveButton compact mimeTypes={MIME_DOKUMEN} onFile={(f) => updateDynamic(state, setState, item.id, 'file', f)} />
             <button type="button" onClick={() => removeDynamic(state, setState, item.id)} style={{ padding: '8px', marginTop: '6px', backgroundColor: '#ffebee', color: '#c62828', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>X</button>
@@ -1650,7 +1664,7 @@ function App() {
                             }}
                             style={{ ...inputStyle, marginTop: 0, flex: 1, backgroundColor: '#fff', color: '#333' }}
                           >
-                            {item.options.map((opt, i) => <option key={i} value={opt}>{opt}</option>)}
+                            {(item.options.includes(item.aturan) ? item.options : [item.aturan, ...item.options]).map((opt, i) => <option key={i} value={opt}>{opt}</option>)}
                           </select>
                         ) : item.type === 'fixed' ? (
                           <textarea rows="2" value={item.aturan} readOnly style={{ ...readOnlyStyle, marginTop: 0, flex: 1, resize: 'none' }}></textarea>

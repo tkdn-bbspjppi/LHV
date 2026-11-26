@@ -274,7 +274,8 @@
       const widthMm = (item.cropRects && item.cropRects[0] && item.cropRects[0].widthMm) || defaultWidthMm;
       const hasCustom = Array.isArray(item.customBlobs) && item.customBlobs.length > 0;
       if (!item.file && !hasCustom) continue;
-      const keterangan = shape === "formulir" ? item.judul || "" : item.keterangan || "";
+      const noKet = !!item.tanpaKeterangan && shape !== "formulir";
+      const keterangan = noKet ? "" : shape === "formulir" ? item.judul || "" : item.keterangan || "";
 
       // Prioritas 1: Hasil crop manual dari modal pratinjau
       if (hasCustom) {
@@ -284,8 +285,9 @@
           if (shape === "std") blob = await normalizeImageProportional(blob, 1200);
           const token = nextToken("dyn");
           imageJobs.set(token, { blob, widthMm });
-          const caption =
-            item.customBlobs.length > 1
+          const caption = noKet
+            ? ""
+            : item.customBlobs.length > 1
               ? keterangan
                 ? `${keterangan} (Halaman ${idx + 1})`
                 : `Halaman ${idx + 1}`
@@ -304,7 +306,7 @@
           if (shape === "std") blob = await normalizeImageProportional(blob, 1200);
           const token = nextToken("dyn");
           imageJobs.set(token, { blob, widthMm });
-          const caption = keterangan ? `${keterangan} (Halaman ${idx + 1})` : `Halaman ${idx + 1}`;
+          const caption = noKet ? "" : keterangan ? `${keterangan} (Halaman ${idx + 1})` : `Halaman ${idx + 1}`;
           result.push({ judul: caption, keterangan: caption, gambar: token });
         }
       } else if (isExcelFile(item.file)) {

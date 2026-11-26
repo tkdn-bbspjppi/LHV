@@ -85,24 +85,23 @@
       .join("");
   }
 
+  // Awalan nomor: BMP memakai "BMP", semua skema TKDN (Produksi Sendiri, Kerjasama, Jasa, Gabungan) memakai "TKDN".
   function kodeSkemaNomor(jenisLhv) {
-    if (jenisLhv === "Kerjasama") return "TKDN-K";
-    if (jenisLhv === "BMP") return "BMP";
-    if (jenisLhv === "Jasa") return "TKDN-J";
-    if (jenisLhv === "Gabungan") return "TKDN-G";
-    return "TKDN";
+    return jenisLhv === "BMP" ? "BMP" : "TKDN";
   }
 
+  // Format nomor LHV:
+  //   {TKDN|BMP}{Tahun}-{Bulan (angka, tanpa nol di depan)}-BBSPJPPI-{ID Berkas}-{Inisial Verifikator}
+  //   mis. TKDN2026-11-BBSPJPPI-2312-BS   (inisial dilewati jika Nama Verifikator kosong)
   function buildNoLhv(state) {
     const tgl = state.tanggalLhv || "";
     const parts = tgl.split("-");
-    const tahun = parts[0] || String(new Date().getFullYear());
-    const bulanNum = parseInt(parts[1], 10) || (new Date().getMonth() + 1);
-    const romawi = ROMAWI[bulanNum] || "I";
+    const tahun = /^\d{4}$/.test(parts[0] || "") ? parts[0] : String(new Date().getFullYear());
+    const bulan = parseInt(parts[1], 10) || (new Date().getMonth() + 1);
     const kode = kodeSkemaNomor(state.jenisLhv);
     const id = (state.idBerkas || "").trim() || "00000";
     const inisial = buatInisial(state.namaVerifikator);
-    return `${id}/LVI-BBSPJPPI/${kode}/${romawi}/${tahun}${inisial ? "/" + inisial : ""}`;
+    return `${kode}${tahun}-${bulan}-BBSPJPPI-${id}${inisial ? "-" + inisial : ""}`;
   }
 
   // Format nama file:

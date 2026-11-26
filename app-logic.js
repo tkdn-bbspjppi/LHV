@@ -105,6 +105,47 @@
     return `${id}/LVI-BBSPJPPI/${kode}/${romawi}/${tahun}${inisial ? "/" + inisial : ""}`;
   }
 
+  // Format nama file:
+  //   TKDN (Produksi Sendiri / Kerjasama): ID Berkas_LHV TKDN Nama Perusahaan_Jenis Barang_Inisial Verifikator.docx
+  //   BMP                                : ID Berkas_LHV BMP Nama Perusahaan_Inisial Verifikator.docx
+  //   Jasa Industri                      : ID Berkas_LHV TKDN Jasa Nama Perusahaan_Jenis Barang/Jasa_Inisial Verifikator.docx
+  //   Gabungan Barang & Jasa             : ID Berkas_LHV TKDN Gabungan Nama Perusahaan_Jenis Barang_Inisial Verifikator.docx
+  // Bagian yang kosong dilewati (tanpa garis bawah ganda).
+  const LABEL_FILE = {
+    "Produksi Sendiri": "LHV TKDN",
+    "Kerjasama": "LHV TKDN",
+    "BMP": "LHV BMP",
+    "Jasa": "LHV TKDN Jasa",
+    "Gabungan": "LHV TKDN Gabungan",
+  };
+
+  function bersihkanNamaFile(str) {
+    return String(str || "")
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function buildFileName(state) {
+    const jenis = state.jenisLhv || "Produksi Sendiri";
+    const label = LABEL_FILE[jenis] || "LHV TKDN";
+    const idBerkas = bersihkanNamaFile(state.idBerkas);
+    const perusahaan = bersihkanNamaFile(state.namaPerusahaan);
+    const jenisBarang = jenis === "BMP" ? "" : bersihkanNamaFile(state.jenisBarang);
+    const inisial = bersihkanNamaFile(buatInisial(state.namaVerifikator));
+
+    const parts = [
+      idBerkas,
+      [label, perusahaan].filter(Boolean).join(" "),
+      jenisBarang,
+      inisial,
+    ].filter(Boolean);
+
+    let base = parts.join("_").replace(/[. ]+$/g, "");
+    if (base.length > 150) base = base.slice(0, 150).replace(/[. _]+$/g, "");
+    return `${base || label}.docx`;
+  }
+
   // =========================================================================
   // 2. PEMROSESAN GAMBAR & PDF (AUTO-TRIM + PROPORTIONAL SCALING)
   // =========================================================================
@@ -631,10 +672,7 @@
     const docxBlob = await DocxEngine.generateDocx(templateBuffer, context, imageJobs);
 
     step("Menyiapkan unduhan...");
-    const safeName = (state.namaPerusahaan || "LHV")
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .trim();
-    const filename = `LHV_${jenisLhv.replace(/\s+/g, "_")}_${safeName}.docx`;
+    const filename = buildFileName(state);
 
     const url = URL.createObjectURL(docxBlob);
     const a = document.createElement("a");
@@ -774,6 +812,7 @@
   global.LHVLogic = {
     generateAndDownload,
     buildNoLhv,
+    buildFileName,
     formatTanggalIndo,
     nilaiKeTerbilangPersen,
     dbSaveProject,

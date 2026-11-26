@@ -355,8 +355,14 @@
       if (tahunOpt) {
         displayYear = tahunOpt[0];
       } else if (noLhv) {
-        const all = String(noLhv).match(/(?<!\d)\d{4}(?!\d)/g);
-        if (all && all.length) displayYear = all[all.length - 1];
+        // Format baru: TKDN2026-11-BBSPJPPI-2312-BS -> tahun = 4 digit tepat setelah awalan TKDN/BMP
+        const mNew = String(noLhv).match(/^(?:TKDN|BMP)(\d{4})-/i);
+        if (mNew) {
+          displayYear = mNew[1];
+        } else {
+          const all = String(noLhv).match(/(?<!\d)\d{4}(?!\d)/g);
+          if (all && all.length) displayYear = all[all.length - 1];
+        }
       }
       const t = posCfg.tahun;
       ctx.font = `${t.weight} ${t.fontSize}px ${FONT_FAMILY}`;
